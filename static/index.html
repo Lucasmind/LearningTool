@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Learning Tool</title>
+    <link rel="stylesheet" href="/static/css/main.css">
+    <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+</head>
+<body>
+    <!-- Sidebar -->
+    <aside id="sidebar" class="sidebar">
+        <div class="sidebar-header">
+            <h1 class="sidebar-title">Learning Tool</h1>
+            <button id="btn-new-session" class="btn btn-primary btn-sm">+ New</button>
+        </div>
+        <div id="session-list" class="session-list">
+            <!-- Sessions populated by JS -->
+        </div>
+        <div class="sidebar-trash-section">
+            <button id="btn-toggle-trash" class="btn btn-sm btn-trash-toggle">Trash</button>
+            <div id="trash-list" class="trash-list hidden">
+                <!-- Trash items populated by JS -->
+            </div>
+        </div>
+        <button id="btn-toggle-sidebar" class="sidebar-toggle" title="Toggle sidebar">◀</button>
+    </aside>
+
+    <!-- Main area -->
+    <main id="main-area" class="main-area">
+        <!-- Top bar -->
+        <div id="top-bar" class="top-bar">
+            <div class="prompt-input-wrap">
+                <input type="text" id="prompt-input" class="prompt-input"
+                       placeholder="Ask a question to start exploring..." autocomplete="off">
+                <button id="btn-submit-prompt" class="btn btn-primary">Send</button>
+            </div>
+            <div class="top-bar-actions">
+                <span id="session-name-display" class="session-name" title="Double-click to rename"></span>
+                <button id="btn-auto-layout" class="btn btn-icon" style="width:auto;padding:0 10px" title="Organize nodes into a tidy tree">Tidy</button>
+                <button id="btn-zoom-in" class="btn btn-icon" title="Zoom in">+</button>
+                <button id="btn-zoom-out" class="btn btn-icon" title="Zoom out">−</button>
+                <button id="btn-zoom-reset" class="btn btn-icon btn-sm" title="Reset zoom">1:1</button>
+                <button id="btn-theme-toggle" class="btn btn-icon" title="Toggle dark/light mode">☀</button>
+            </div>
+        </div>
+
+        <!-- Canvas viewport -->
+        <div id="canvas-viewport" class="canvas-viewport">
+            <div id="canvas-world" class="canvas-world">
+                <svg id="edge-layer" class="edge-layer"></svg>
+                <!-- Nodes are appended here by JS -->
+            </div>
+        </div>
+
+        <!-- Context menu (hidden by default) -->
+        <div id="context-menu" class="context-menu hidden">
+            <button data-action="explain" class="ctx-btn">🔍 Explain in Context</button>
+            <button data-action="deeper" class="ctx-btn">📚 Dig Deeper</button>
+            <button data-action="question" class="ctx-btn">❓ Ask a Question</button>
+        </div>
+    </main>
+
+    <!-- Scripts -->
+    <script src="/static/js/marked.min.js"></script>
+    <script src="/static/vendor/katex/katex.min.js"></script>
+    <script src="/static/vendor/katex/contrib/auto-render.min.js"></script>
+    <script src="/static/js/api.js"></script>
+    <script src="/static/js/canvas.js"></script>
+    <script src="/static/js/edge.js"></script>
+    <script src="/static/js/node.js"></script>
+    <script src="/static/js/context_menu.js"></script>
+    <script src="/static/js/session.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
