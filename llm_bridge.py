@@ -63,13 +63,24 @@ class OpenAICompatibleProvider:
     def __init__(self, url: str = DEFAULT_LLM_URL, model: str = DEFAULT_LLM_MODEL,
                  api_key: str = "", max_tokens: int = 4096, temperature: float = 0.7,
                  timeout: int = 300, provider_id: str = ""):
-        self._url = url
+        self._url = self._normalize_url(url)
         self._model = model
         self._api_key = api_key
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._timeout = timeout
         self.provider_id = provider_id
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """Auto-append /v1/chat/completions if user provided just a base URL."""
+        url = url.rstrip("/")
+        if not url.endswith("/chat/completions"):
+            if url.endswith("/v1"):
+                url += "/chat/completions"
+            else:
+                url += "/v1/chat/completions"
+        return url
 
     def _headers(self) -> dict:
         headers = {"Content-Type": "application/json"}

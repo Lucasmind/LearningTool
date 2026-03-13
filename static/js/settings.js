@@ -254,7 +254,7 @@ const Settings = (() => {
                 { value: 'openai-compatible', label: 'OpenAI-Compatible API' },
                 { value: 'claude-cli', label: 'Claude Code (CLI)' },
             ], value: existing?.type || 'openai-compatible' },
-            { key: 'url', label: 'API URL', type: 'text', value: existing?.url || '', hideFor: 'claude-cli' },
+            { key: 'url', label: 'API URL', type: 'text', value: existing?.url || '', hideFor: 'claude-cli', placeholder: 'e.g. http://localhost:8080 or http://api.openai.com/v1/chat/completions' },
             { key: 'model', label: 'Model', type: 'text', value: existing?.model || '', placeholder: 'e.g. opus, sonnet, haiku (for CLI) or gpt-4o (for API)' },
             { key: 'api_key', label: 'API Key', type: 'password', value: existing?.api_key || '', hideFor: 'claude-cli' },
             { key: 'max_tokens', label: 'Max Tokens', type: 'number', value: existing?.max_tokens ?? 4096 },
