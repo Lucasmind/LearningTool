@@ -184,13 +184,23 @@ const Settings = (() => {
 
         const defBtn = document.createElement('button');
         defBtn.className = 'btn btn-sm';
-        defBtn.textContent = 'Set Default';
-        defBtn.disabled = p.id === defaultId;
+        if (p.id === defaultId) {
+            defBtn.textContent = 'Is Default';
+            defBtn.disabled = true;
+            defBtn.style.opacity = '0.5';
+        } else {
+            defBtn.textContent = 'Set Default';
+        }
         defBtn.addEventListener('click', async () => {
-            await API.setDefaultProvider(p.id);
-            defaultId = p.id;
-            loadProviders();
-            App.loadProviderDropdown();
+            try {
+                await API.setDefaultProvider(p.id);
+                defaultId = p.id;
+                await loadProviders();
+                App.loadProviderDropdown();
+            } catch (e) {
+                console.error('Set default failed:', e);
+                alert('Failed to set default: ' + e.message);
+            }
         });
 
         const delBtn = document.createElement('button');
@@ -245,7 +255,7 @@ const Settings = (() => {
                 { value: 'claude-cli', label: 'Claude Code (CLI)' },
             ], value: existing?.type || 'openai-compatible' },
             { key: 'url', label: 'API URL', type: 'text', value: existing?.url || '', hideFor: 'claude-cli' },
-            { key: 'model', label: 'Model', type: 'text', value: existing?.model || '' },
+            { key: 'model', label: 'Model', type: 'text', value: existing?.model || '', placeholder: 'e.g. opus, sonnet, haiku (for CLI) or gpt-4o (for API)' },
             { key: 'api_key', label: 'API Key', type: 'password', value: existing?.api_key || '', hideFor: 'claude-cli' },
             { key: 'max_tokens', label: 'Max Tokens', type: 'number', value: existing?.max_tokens ?? 4096 },
             { key: 'temperature', label: 'Temperature', type: 'number', value: existing?.temperature ?? 0.7, step: '0.1' },
@@ -286,6 +296,7 @@ const Settings = (() => {
                 input.type = f.type;
                 input.value = f.value;
                 if (f.step) input.step = f.step;
+                if (f.placeholder) input.placeholder = f.placeholder;
                 if (f.type === 'password') input.placeholder = existing ? '(unchanged)' : '';
             }
 

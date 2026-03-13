@@ -15,10 +15,29 @@ class ClaudeCLIProvider:
     binary. Prompt text is passed via stdin pipe, not as a shell argument.
     """
 
+    # Claude CLI accepts short model names: opus, sonnet, haiku
+    MODEL_ALIASES = {
+        "opus": "opus", "opus 4.6": "opus", "claude opus": "opus", "claude-opus-4-6": "opus",
+        "sonnet": "sonnet", "sonnet 4.6": "sonnet", "claude sonnet": "sonnet", "claude-sonnet-4-6": "sonnet",
+        "haiku": "haiku", "haiku 4.5": "haiku", "claude haiku": "haiku", "claude-haiku-4-5": "haiku",
+    }
+
     def __init__(self, model: str = "opus", timeout: int = 120, provider_id: str = ""):
-        self._model = model
+        self._model = self._normalize_model(model)
         self._timeout = timeout
         self.provider_id = provider_id
+
+    @classmethod
+    def _normalize_model(cls, model: str) -> str:
+        """Normalize model name to Claude CLI short format."""
+        lookup = model.strip().lower()
+        if lookup in cls.MODEL_ALIASES:
+            return cls.MODEL_ALIASES[lookup]
+        # If it contains a known name, extract it
+        for key in ("opus", "sonnet", "haiku"):
+            if key in lookup:
+                return key
+        return model  # Pass through as-is, CLI will validate
 
     async def submit(self, prompt: str, timeout: int = None) -> dict:
         """Send prompt to Claude CLI and return complete response."""
@@ -57,7 +76,9 @@ class ClaudeCLIProvider:
 
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Claude CLI error (exit {proc.returncode}): {err}")
+            out = stdout.decode("utf-8", errors="replace").strip()
+            detail = err or out or "(no output)"
+            raise RuntimeError(f"Claude CLI error (exit {proc.returncode}): {detail}")
 
         # Parse JSON response
         try:
