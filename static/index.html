@@ -35,12 +35,14 @@
                        placeholder="Ask a question to start exploring..." autocomplete="off">
                 <button id="btn-submit-prompt" class="btn btn-primary">Send</button>
             </div>
+            <select id="provider-select" class="provider-select" title="Select AI provider"></select>
             <div class="top-bar-actions">
                 <span id="session-name-display" class="session-name" title="Double-click to rename"></span>
                 <button id="btn-auto-layout" class="btn btn-icon" style="width:auto;padding:0 10px" title="Organize nodes into a tidy tree">Tidy</button>
                 <button id="btn-zoom-in" class="btn btn-icon" title="Zoom in">+</button>
                 <button id="btn-zoom-out" class="btn btn-icon" title="Zoom out">−</button>
                 <button id="btn-zoom-reset" class="btn btn-icon btn-sm" title="Reset zoom">1:1</button>
+                <button id="btn-settings" class="btn btn-icon" title="Settings">&#9881;</button>
                 <button id="btn-theme-toggle" class="btn btn-icon" title="Toggle dark/light mode">☀</button>
             </div>
         </div>
@@ -61,6 +63,12 @@
         </div>
     </main>
 
+    <!-- Settings overlay -->
+    <div id="settings-overlay" class="settings-overlay hidden">
+        <div class="settings-backdrop"></div>
+        <div class="settings-panel"></div>
+    </div>
+
     <!-- Scripts -->
     <script src="/static/js/marked.min.js"></script>
     <script src="/static/vendor/katex/katex.min.js"></script>
@@ -71,6 +79,7 @@
     <script src="/static/js/node.js"></script>
     <script src="/static/js/context_menu.js"></script>
     <script src="/static/js/session.js"></script>
+    <script src="/static/js/settings.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 </html>

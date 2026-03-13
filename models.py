@@ -13,6 +13,7 @@ class QueryRequest(BaseModel):
     mode: str = "initial"  # initial | explain | deeper | question
     highlighted_text: Optional[str] = None
     user_question: Optional[str] = None
+    provider_id: Optional[str] = None
 
 
 class QueryResponse(BaseModel):
@@ -107,3 +108,33 @@ class SessionSaveRequest(BaseModel):
     nodes: dict[str, NodeData] = {}
     edges: list[EdgeData] = []
     highlights: dict[str, HighlightData] = {}
+
+
+# ---- Provider models ----
+
+class ProviderCreate(BaseModel):
+    alias: str
+    type: str = "openai-compatible"  # openai-compatible | claude-cli
+    url: str = ""
+    model: str = ""
+    api_key: str = ""
+    enabled: bool = True
+    max_tokens: int = 4096
+    temperature: float = 0.7
+    timeout: int = 300
+
+
+class ProviderUpdate(BaseModel):
+    alias: Optional[str] = None
+    type: Optional[str] = None
+    url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    enabled: Optional[bool] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    timeout: Optional[int] = None
+
+
+class DefaultProviderSet(BaseModel):
+    provider_id: Optional[str] = None

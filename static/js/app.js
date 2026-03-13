@@ -10,6 +10,7 @@ const App = (() => {
         EdgeRenderer.init();
         Session.init();
         ContextMenu.init();
+        Settings.init();
 
         // Theme toggle
         const themeBtn = document.getElementById('btn-theme-toggle');
@@ -39,16 +40,54 @@ const App = (() => {
         // Auto-layout button
         document.getElementById('btn-auto-layout').addEventListener('click', autoLayout);
 
+        // Settings button
+        document.getElementById('btn-settings').addEventListener('click', () => Settings.show());
+
         // Keyboard shortcuts
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
                 ContextMenu.hide();
+                Settings.hide();
             }
             if (e.ctrlKey && e.key === 's') {
                 e.preventDefault();
                 Session.scheduleSave();
             }
         });
+
+        // Load provider dropdown
+        loadProviderDropdown();
+    }
+
+    function getSelectedProviderId() {
+        const sel = document.getElementById('provider-select');
+        return sel ? sel.value : null;
+    }
+
+    async function loadProviderDropdown() {
+        try {
+            const data = await API.getProviderList();
+            const sel = document.getElementById('provider-select');
+            if (!sel) return;
+            // Clear existing options using DOM methods
+            while (sel.firstChild) sel.removeChild(sel.firstChild);
+            const saved = localStorage.getItem('lt-provider');
+            for (const p of data.providers) {
+                if (!p.enabled) continue;
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.textContent = p.alias;
+                if (p.id === saved || (!saved && p.id === data.default_provider_id)) {
+                    opt.selected = true;
+                }
+                sel.appendChild(opt);
+            }
+            sel.addEventListener('change', () => {
+                localStorage.setItem('lt-provider', sel.value);
+            });
+        } catch (e) {
+            console.warn('Failed to load provider list:', e);
+        }
     }
 
     function updateThemeIcon(btn, theme) {
@@ -246,6 +285,8 @@ const App = (() => {
 
     /** Stream a query to a node via SSE. Shows thinking, then streams content tokens. */
     function streamQueryToNode(queryData, nodeId) {
+        // Inject selected provider
+        queryData.provider_id = getSelectedProviderId();
         const session = Session.getCurrent();
         let contentStarted = false;
 
@@ -272,6 +313,9 @@ const App = (() => {
                     EdgeRenderer.redrawAll();
                     setTimeout(() => EdgeRenderer.redrawAll(), 150);
                 });
+            },
+            onFallback(fromId, toId) {
+                showToast(`Switched to fallback provider`);
             },
             onError(msg) {
                 NodeRenderer.updateNode(nodeId, {
@@ -492,8 +536,20 @@ const App = (() => {
         });
     }
 
+    function showToast(message) {
+        const toast = document.createElement('div');
+        toast.className = 'toast';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        requestAnimationFrame(() => toast.classList.add('visible'));
+        setTimeout(() => {
+            toast.classList.remove('visible');
+            setTimeout(() => toast.remove(), 300);
+        }, 3000);
+    }
+
     // Public API
-    return { init, spawnChild, submitQuestion, retryNode, autoLayout };
+    return { init, spawnChild, submitQuestion, retryNode, autoLayout, loadProviderDropdown, showToast };
 })();
 
 // Boot

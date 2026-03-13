@@ -20,16 +20,18 @@ from fastapi.responses import FileResponse, StreamingResponse
 from models import (
     QueryRequest, QueryResponse, JobStatusResponse,
     SessionCreate, SessionRename, SessionSummary, SessionFull,
-    SessionSaveRequest,
+    SessionSaveRequest, ProviderCreate, ProviderUpdate, DefaultProviderSet,
 )
-from llm_bridge import LocalLLMQueue
+from llm_bridge import ProviderRegistry
 from prompt_engineer import build_prompt, build_lineage_context
 from session_manager import SessionManager
+from settings_manager import SettingsManager
 
 # ---- Paths ----
 BASE_DIR = Path(__file__).parent.resolve()
 STATIC_DIR = BASE_DIR / "static"
 SESSIONS_DIR = BASE_DIR / "learning_sessions"
+SETTINGS_DIR = BASE_DIR / "settings"
 
 # ---- Parse CLI args (before FastAPI setup) ----
 _parser = argparse.ArgumentParser(description="Learning Tool server")
@@ -41,14 +43,22 @@ _parser.add_argument("--llm-model", default="",
 _cli_args, _ = _parser.parse_known_args()
 
 # ---- Shared state ----
-chat_queue = LocalLLMQueue(url=_cli_args.llm_url, model=_cli_args.llm_model)
+settings_mgr = SettingsManager(SETTINGS_DIR, cli_url=_cli_args.llm_url, cli_model=_cli_args.llm_model)
+provider_registry = ProviderRegistry(settings_mgr)
 session_mgr = SessionManager(SESSIONS_DIR)
-
-# Direct local LLM access for fast tasks (title generation)
-_title_llm = LocalLLMQueue(url=_cli_args.llm_url, model=_cli_args.llm_model)
 
 # Track running jobs: job_id -> dict
 jobs: dict[str, dict] = {}
+
+
+def _get_provider(provider_id: str | None = None):
+    """Get provider by ID or return default."""
+    if provider_id:
+        try:
+            return provider_registry.get(provider_id)
+        except ValueError:
+            pass
+    return provider_registry.get_default()
 
 
 @asynccontextmanager
@@ -95,10 +105,11 @@ async def submit_query(req: QueryRequest):
         "result": None,
         "error": None,
         "original_request": req.dict(),
+        "provider_id": req.provider_id,
     }
 
     # Fire and forget — the queue serializes execution
-    asyncio.ensure_future(_run_job(job_id, engineered))
+    asyncio.ensure_future(_run_job(job_id, engineered, req.provider_id))
 
     return QueryResponse(
         job_id=job_id,
@@ -107,15 +118,26 @@ async def submit_query(req: QueryRequest):
     )
 
 
-async def _run_job(job_id: str, prompt: str):
+async def _run_job(job_id: str, prompt: str, provider_id: str | None = None):
     """Background task: run LLM query and store result."""
     job = jobs[job_id]
+    provider = _get_provider(provider_id)
     try:
         job["status"] = "running"
-        result = await chat_queue.submit(prompt)
+        result = await provider.submit(prompt)
         job["status"] = "complete"
         job["result"] = result
     except Exception as e:
+        # Try fallback
+        fallback = provider_registry.get_fallback()
+        if fallback and fallback.provider_id != provider.provider_id:
+            try:
+                result = await fallback.submit(prompt)
+                job["status"] = "complete"
+                job["result"] = result
+                return
+            except Exception:
+                pass
         job["status"] = "error"
         job["error"] = str(e)
 
@@ -147,6 +169,7 @@ async def retry_query(job_id: str):
         raise HTTPException(404, "Job not found")
     old = jobs[job_id]
     prompt = old["engineered_prompt"]
+    provider_id = old.get("provider_id")
     new_job_id = f"job_{uuid.uuid4().hex[:12]}"
     jobs[new_job_id] = {
         "status": "queued",
@@ -155,8 +178,9 @@ async def retry_query(job_id: str):
         "result": None,
         "error": None,
         "original_request": old["original_request"],
+        "provider_id": provider_id,
     }
-    asyncio.ensure_future(_run_job(new_job_id, prompt))
+    asyncio.ensure_future(_run_job(new_job_id, prompt, provider_id))
     return QueryResponse(job_id=new_job_id, status="queued", engineered_prompt=prompt)
 
 
@@ -166,7 +190,7 @@ async def retry_query(job_id: str):
 async def stream_query(req: QueryRequest):
     """Stream LLM response via Server-Sent Events.
 
-    Events: prompt, thinking, token, done, error
+    Events: prompt, thinking, token, done, error, fallback
     """
     session_data = None
     if req.session_id:
@@ -181,12 +205,14 @@ async def stream_query(req: QueryRequest):
         parent_node_id=req.parent_node_id,
     )
 
+    provider = _get_provider(req.provider_id)
+
     async def event_stream():
         # Send engineered prompt first so frontend can store it
         yield f"event: prompt\ndata: {json.dumps({'engineered_prompt': engineered})}\n\n"
 
         try:
-            async for event_type, data in chat_queue.stream(engineered):
+            async for event_type, data in provider.stream(engineered):
                 if event_type == "thinking":
                     yield f"event: thinking\ndata: {{}}\n\n"
                 elif event_type == "token":
@@ -194,8 +220,39 @@ async def stream_query(req: QueryRequest):
                 elif event_type == "done":
                     yield f"event: done\ndata: {json.dumps({'text': data})}\n\n"
                 elif event_type == "error":
+                    # Try fallback on error
+                    fallback = provider_registry.get_fallback()
+                    if fallback and fallback.provider_id != provider.provider_id:
+                        yield f"event: fallback\ndata: {json.dumps({'from': provider.provider_id, 'to': fallback.provider_id})}\n\n"
+                        async for fb_type, fb_data in fallback.stream(engineered):
+                            if fb_type == "thinking":
+                                yield f"event: thinking\ndata: {{}}\n\n"
+                            elif fb_type == "token":
+                                yield f"event: token\ndata: {json.dumps({'text': fb_data})}\n\n"
+                            elif fb_type == "done":
+                                yield f"event: done\ndata: {json.dumps({'text': fb_data})}\n\n"
+                            elif fb_type == "error":
+                                yield f"event: error\ndata: {json.dumps({'error': fb_data})}\n\n"
+                        return
                     yield f"event: error\ndata: {json.dumps({'error': data})}\n\n"
         except Exception as e:
+            # Try fallback on exception
+            fallback = provider_registry.get_fallback()
+            if fallback and fallback.provider_id != provider.provider_id:
+                yield f"event: fallback\ndata: {json.dumps({'from': provider.provider_id, 'to': fallback.provider_id})}\n\n"
+                try:
+                    async for fb_type, fb_data in fallback.stream(engineered):
+                        if fb_type == "thinking":
+                            yield f"event: thinking\ndata: {{}}\n\n"
+                        elif fb_type == "token":
+                            yield f"event: token\ndata: {json.dumps({'text': fb_data})}\n\n"
+                        elif fb_type == "done":
+                            yield f"event: done\ndata: {json.dumps({'text': fb_data})}\n\n"
+                        elif fb_type == "error":
+                            yield f"event: error\ndata: {json.dumps({'error': fb_data})}\n\n"
+                except Exception as fb_e:
+                    yield f"event: error\ndata: {json.dumps({'error': str(fb_e)})}\n\n"
+                return
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(
@@ -205,13 +262,14 @@ async def stream_query(req: QueryRequest):
     )
 
 
-# ---- API: Title generation (uses local LLM directly, fast) ----
+# ---- API: Title generation (uses default provider) ----
 
 @app.post("/api/generate-title")
 async def generate_title(req: QueryRequest):
-    """Generate a short session title from the first prompt via local LLM."""
+    """Generate a short session title from the first prompt via LLM."""
     try:
-        result = await _title_llm.submit(
+        provider = provider_registry.get_default()
+        result = await provider.submit(
             f'Generate a short title (max 6 words, no quotes, no punctuation at the end) '
             f'for a research session about this question:\n"{req.prompt_text}"\n'
             f'Reply with ONLY the title, nothing else.',
@@ -225,6 +283,87 @@ async def generate_title(req: QueryRequest):
         return {"title": title}
     except Exception as e:
         return {"title": "Untitled Session", "error": str(e)}
+
+
+# ---- API: Settings endpoints ----
+
+@app.get("/api/settings/providers")
+async def list_providers():
+    """List all providers with masked API keys."""
+    providers = settings_mgr.get_all_providers()
+    return {
+        "providers": providers,
+        "default_provider_id": settings_mgr.get_default_id(),
+        "fallback_provider_id": settings_mgr.get_fallback_id(),
+    }
+
+
+@app.get("/api/settings/provider-list")
+async def provider_list():
+    """Lightweight provider list for dropdown."""
+    return {
+        "providers": settings_mgr.get_provider_list(),
+        "default_provider_id": settings_mgr.get_default_id(),
+    }
+
+
+@app.post("/api/settings/providers")
+async def add_provider(req: ProviderCreate):
+    """Add a new LLM provider."""
+    provider = settings_mgr.add_provider(req.dict())
+    provider_registry.refresh()
+    return provider
+
+
+@app.put("/api/settings/providers/{provider_id}")
+async def update_provider(provider_id: str, req: ProviderUpdate):
+    """Update an existing provider."""
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    result = settings_mgr.update_provider(provider_id, updates)
+    if not result:
+        raise HTTPException(404, "Provider not found")
+    provider_registry.refresh()
+    return result
+
+
+@app.delete("/api/settings/providers/{provider_id}")
+async def delete_provider(provider_id: str):
+    """Delete a provider."""
+    ok = settings_mgr.delete_provider(provider_id)
+    if not ok:
+        raise HTTPException(400, "Cannot delete provider (not found or last remaining)")
+    provider_registry.refresh()
+    return {"status": "deleted"}
+
+
+@app.post("/api/settings/providers/{provider_id}/test")
+async def test_provider(provider_id: str):
+    """Test connectivity to a provider."""
+    raw = settings_mgr.get_provider_raw(provider_id)
+    if not raw:
+        raise HTTPException(404, "Provider not found")
+
+    # Create a temporary provider instance for testing
+    from llm_bridge import ProviderRegistry as PR
+    temp_provider = PR._create(raw)
+    result = await temp_provider.test()
+    return result
+
+
+@app.put("/api/settings/default-provider")
+async def set_default_provider(req: DefaultProviderSet):
+    """Set the default provider."""
+    if not settings_mgr.set_default(req.provider_id):
+        raise HTTPException(400, "Provider not found")
+    return {"status": "ok", "default_provider_id": req.provider_id}
+
+
+@app.put("/api/settings/fallback-provider")
+async def set_fallback_provider(req: DefaultProviderSet):
+    """Set the fallback provider (or None to clear)."""
+    if not settings_mgr.set_fallback(req.provider_id):
+        raise HTTPException(400, "Provider not found")
+    return {"status": "ok", "fallback_provider_id": req.provider_id}
 
 
 # ---- API: Session endpoints ----
@@ -300,6 +439,7 @@ if __name__ == "__main__":
     import uvicorn
     port = _cli_args.port
     print(f"Learning Tool starting at http://localhost:{port}")
-    print(f"LLM endpoint: {_cli_args.llm_url}")
-    print(f"Model: {_cli_args.llm_model}")
+    default_prov = settings_mgr.get_provider(settings_mgr.get_default_id())
+    if default_prov:
+        print(f"Default provider: {default_prov['alias']} ({default_prov['type']})")
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")

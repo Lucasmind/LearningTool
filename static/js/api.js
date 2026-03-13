@@ -72,7 +72,7 @@ const API = (() => {
     /**
      * Stream a query via SSE. Calls callbacks as events arrive.
      * @param {object} data — query request body
-     * @param {object} callbacks — { onPrompt, onThinking, onToken, onDone, onError }
+     * @param {object} callbacks — { onPrompt, onThinking, onToken, onDone, onError, onFallback }
      */
     async function streamQuery(data, callbacks) {
         const resp = await fetch(BASE + '/api/query/stream', {
@@ -102,6 +102,7 @@ const API = (() => {
                         else if (eventType === 'thinking' && callbacks.onThinking) callbacks.onThinking();
                         else if (eventType === 'token' && callbacks.onToken) callbacks.onToken(payload.text);
                         else if (eventType === 'done' && callbacks.onDone) callbacks.onDone(payload.text);
+                        else if (eventType === 'fallback' && callbacks.onFallback) callbacks.onFallback(payload.from, payload.to);
                         else if (eventType === 'error' && callbacks.onError) callbacks.onError(payload.error);
                     } catch (e) {
                         // skip malformed JSON
@@ -136,5 +137,38 @@ const API = (() => {
         });
     }
 
-    return { submitQuery, queryStatus, retryQuery, streamQuery, listSessions, createSession, loadSession, saveSession, renameSession, deleteSession, listTrash, restoreSession, permanentDeleteSession, generateTitle };
+    // ---- Settings / Providers ----
+    function getProviderList() {
+        return _fetch('/api/settings/provider-list');
+    }
+
+    function getProviders() {
+        return _fetch('/api/settings/providers');
+    }
+
+    function addProvider(config) {
+        return _fetch('/api/settings/providers', { method: 'POST', body: JSON.stringify(config) });
+    }
+
+    function updateProvider(id, data) {
+        return _fetch(`/api/settings/providers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+    }
+
+    function deleteProvider(id) {
+        return _fetch(`/api/settings/providers/${id}`, { method: 'DELETE' });
+    }
+
+    function testProvider(id) {
+        return _fetch(`/api/settings/providers/${id}/test`, { method: 'POST' });
+    }
+
+    function setDefaultProvider(id) {
+        return _fetch('/api/settings/default-provider', { method: 'PUT', body: JSON.stringify({ provider_id: id }) });
+    }
+
+    function setFallbackProvider(id) {
+        return _fetch('/api/settings/fallback-provider', { method: 'PUT', body: JSON.stringify({ provider_id: id || null }) });
+    }
+
+    return { submitQuery, queryStatus, retryQuery, streamQuery, listSessions, createSession, loadSession, saveSession, renameSession, deleteSession, listTrash, restoreSession, permanentDeleteSession, generateTitle, getProviderList, getProviders, addProvider, updateProvider, deleteProvider, testProvider, setDefaultProvider, setFallbackProvider };
 })();

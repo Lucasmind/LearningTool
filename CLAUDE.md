@@ -11,7 +11,7 @@ A local web-based knowledge exploration tool with a node-graph canvas UI. Users 
 ```bash
 python app.py
 
-# Custom options
+# Custom options (only used on first run to seed provider settings)
 python app.py --port 9000 --llm-model "my-model.gguf"
 ```
 
@@ -24,19 +24,24 @@ LearningSystem/
 ├── app.py                     # FastAPI server, routes, SSE streaming endpoint
 ├── models.py                  # Pydantic request/response models
 ├── prompt_engineer.py         # Prompt templates with lineage context
-├── llm_bridge.py              # Async LLM bridge (OpenAI-compatible API)
+├── llm_bridge.py              # OpenAICompatibleProvider, ProviderRegistry
+├── claude_cli_provider.py     # Claude Code CLI subprocess provider
 ├── session_manager.py         # File-based session CRUD + trash
+├── settings_manager.py        # LLM provider settings persistence
+├── settings/                  # Provider config (gitignored, contains API keys)
+│   └── providers.json         # All provider configs, default/fallback selection
 ├── static/
 │   ├── index.html             # Single-page HTML shell
 │   ├── css/main.css           # All styles, dark/light themes
 │   ├── js/
 │   │   ├── api.js             # Fetch wrappers + SSE streaming consumer
-│   │   ├── app.js             # Main controller, workflows
+│   │   ├── app.js             # Main controller, workflows, provider dropdown
 │   │   ├── canvas.js          # Infinite canvas pan/zoom
 │   │   ├── context_menu.js    # Text selection, highlighting, actions
 │   │   ├── edge.js            # SVG Bezier edge rendering
 │   │   ├── node.js            # Node DOM, drag, resize, streaming, math
 │   │   ├── session.js         # Session CRUD, sidebar UI, auto-save
+│   │   ├── settings.js        # Settings overlay UI for provider management
 │   │   └── marked.min.js      # Vendored markdown parser
 │   └── vendor/katex/          # Vendored KaTeX v0.16.21 (LaTeX math rendering)
 ├── learning_sessions/         # Active session data (JSON files)
@@ -49,7 +54,16 @@ LearningSystem/
 - **Frontend:** Vanilla JS with IIFE module pattern. CSS transform-based infinite canvas. Nodes are absolute-positioned divs, edges are SVG Bezier curves.
 - **Backend:** FastAPI + Uvicorn. SSE streaming endpoint for real-time token delivery from LLM to browser.
 - **Persistence:** File-based JSON sessions in `learning_sessions/{YYYYMMDD_HHMMSS}/session.json`. Auto-save with 2-second debounce, flush on session switch, `sendBeacon` on page close.
-- **LLM Integration:** OpenAI-compatible API via SSE streaming (default: chimera AI server at `192.168.1.221:8080`). Thinking token detection and filtering. Non-streaming fallback.
+- **LLM Integration:** Multi-provider support via `ProviderRegistry`. Supports OpenAI-compatible APIs (local/cloud) and Claude Code CLI. Provider settings stored in `settings/providers.json`. Each query can target a specific provider via dropdown selection. Fallback provider support on failure.
+
+## Multi-Provider System
+
+- **Settings UI:** Gear icon in top bar opens settings overlay for full provider CRUD
+- **Provider types:** `openai-compatible` (HTTP API with optional Bearer auth) and `claude-cli` (subprocess via `claude -p --output-format json`)
+- **Provider dropdown:** Top bar dropdown lets user switch active provider per-query, persisted in localStorage
+- **Default/Fallback:** Configurable default provider + optional fallback on failure
+- **First-run migration:** CLI args `--llm-url`/`--llm-model` seed initial provider settings on first run; subsequent runs use saved settings
+- **API key security:** Keys stored server-side in `settings/providers.json` (gitignored), masked when sent to frontend
 
 ## Key Patterns
 
@@ -64,8 +78,8 @@ LearningSystem/
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | 8100 | Server port |
-| `--llm-url` | `http://192.168.1.221:8080/v1/chat/completions` | LLM endpoint (chimera AI server) |
-| `--llm-model` | `""` | Model name (empty = use server default) |
+| `--llm-url` | `http://192.168.1.221:8080/v1/chat/completions` | LLM endpoint (seeds first-run settings) |
+| `--llm-model` | `""` | Model name (seeds first-run settings) |
 
 ## Dependencies
 
@@ -73,12 +87,13 @@ LearningSystem/
 
 **JavaScript:** `marked.min.js` vendored, `KaTeX v0.16.21` vendored (no CDN, no npm)
 
-**External:** OpenAI-compatible LLM server (default: chimera at `192.168.1.221:8080`)
+**External:** Any OpenAI-compatible LLM server, and/or Claude Code CLI (`claude` binary)
 
 ## Development Notes
 
 - All frontend modules use the IIFE pattern returning a public API object
 - No build step — edit JS/CSS directly, refresh browser
 - Session data is plain JSON — can be inspected/edited manually
+- `settings/` directory is gitignored (contains API keys)
 - Development history documented in `development-docs/development-journey.md`
 - System architecture documented in `development-docs/system-architecture.md`
