@@ -40,19 +40,20 @@ Opens at `http://localhost:8100`
 │                  FastAPI Server (app.py)                   │
 │                                                           │
 │  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
-│  │ Query API    │  │ Session API   │  │ Trash API      │  │
-│  │ POST stream  │  │ CRUD sessions │  │ list/restore/  │  │
-│  │ SSE response │  │ save/load     │  │ permanent del  │  │
+│  │ Query API    │  │ Session API   │  │ Settings API   │  │
+│  │ POST stream  │  │ CRUD sessions │  │ Provider CRUD  │  │
+│  │ SSE response │  │ save/load     │  │ test/default   │  │
 │  └──────┬──────┘  └──────┬───────┘  └───────┬────────┘  │
 │         │                │                   │            │
-│  ┌──────▼──────┐  ┌──────▼───────────────────▼────────┐  │
-│  │ Prompt      │  │ SessionManager                    │  │
-│  │ Engineer    │  │ File-based JSON persistence        │  │
-│  └──────┬──────┘  └──────────────────────────────────┘  │
-│         │                                                 │
-│  ┌──────▼──────────────────────────────────────────────┐ │
-│  │ LocalLLMQueue (llm_bridge.py)                       │ │
-│  │ Async LLM bridge — SSE streaming via OpenAI API     │ │
+│  ┌──────▼──────┐  ┌──────▼───────┐  ┌───────▼────────┐  │
+│  │ Prompt      │  │ Session      │  │ Settings       │  │
+│  │ Engineer    │  │ Manager      │  │ Manager        │  │
+│  └──────┬──────┘  └──────────────┘  └───────┬────────┘  │
+│         │                                    │            │
+│  ┌──────▼────────────────────────────────────▼─────────┐ │
+│  │ ProviderRegistry (llm_bridge.py)                    │ │
+│  │ Factory → OpenAICompatibleProvider | ClaudeCLIProvider│ │
+│  │ Default + Fallback provider routing                 │ │
 │  └─────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -69,8 +70,10 @@ The main server file. Parses CLI args, initializes shared state, defines all API
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | 8100 | Server port |
-| `--llm-url` | `http://192.168.1.221:8080/v1/chat/completions` | LLM endpoint (chimera AI server) |
-| `--llm-model` | `""` | Model name (empty = use server default) |
+| `--llm-url` | `http://192.168.1.221:8080/v1/chat/completions` | LLM endpoint (used for first-run seeding only) |
+| `--llm-model` | `""` | Model name (used for first-run seeding only) |
+
+**Note:** CLI args `--llm-url` and `--llm-model` are only used to seed the initial `settings/providers.json` on first run. After that, provider configuration is managed through the settings UI and persisted in the settings file.
 
 **API Endpoints:**
 
@@ -90,24 +93,37 @@ The main server file. Parses CLI args, initializes shared state, defines all API
 | `GET` | `/api/trash` | List trashed sessions |
 | `POST` | `/api/trash/{id}/restore` | Restore from trash |
 | `DELETE` | `/api/trash/{id}` | Permanently delete |
+| `GET` | `/api/settings/providers` | List all providers (keys masked) |
+| `POST` | `/api/settings/providers` | Add a new provider |
+| `PUT` | `/api/settings/providers/{id}` | Update provider config |
+| `DELETE` | `/api/settings/providers/{id}` | Delete provider |
+| `POST` | `/api/settings/providers/{id}/test` | Test provider connectivity |
+| `PUT` | `/api/settings/default-provider` | Set default provider |
+| `PUT` | `/api/settings/fallback-provider` | Set fallback provider |
+| `GET` | `/api/settings/provider-list` | Lightweight provider list for dropdown |
 
 **Streaming query lifecycle (SSE):**
 1. `POST /api/query/stream` builds the engineered prompt, returns `StreamingResponse` (SSE)
-2. SSE events flow: `prompt` (engineered prompt) → `thinking` (model reasoning) → `token` (content chunks) → `done` (full text) or `error`
-3. Frontend consumes via `fetch` + `ReadableStream` reader, progressively rendering tokens into the node
-4. Thinking tokens are detected and filtered (supports `<think>`, `<|channel|>analysis`, bare "analysis" prefix)
+2. Provider resolved from `provider_id` in request body, or default provider
+3. SSE events flow: `prompt` (engineered prompt) → `thinking` (model reasoning) → `token` (content chunks) → `done` (full text) or `error`
+4. On failure with fallback configured: emits `event: fallback` SSE event, retries with fallback provider
+5. Frontend consumes via `fetch` + `ReadableStream` reader, progressively rendering tokens into the node
+6. Thinking tokens are detected and filtered (supports `<think>`, `<|channel|>analysis`, bare "analysis" prefix)
 
 ### `models.py` — Pydantic Models
 
 Data models for API request/response validation:
 
-- `QueryRequest` — prompt text, mode (initial/explain/deeper/question), parent references
+- `QueryRequest` — prompt text, mode (initial/explain/deeper/question), parent references, `provider_id` (optional)
 - `QueryResponse` — job_id, status, engineered prompt
 - `JobStatusResponse` — status, elapsed time, response content
 - `SessionFull` — complete session state: viewport, nodes dict, edges list, highlights dict
 - `NodeData` — id, position, dimensions (width/height), prompt, response, status, collapsed states (prompt/response), parent/highlight references
 - `EdgeData` — source node + highlight -> target node
 - `HighlightData` — id, node, text, color
+- `ProviderCreate` — alias, type, url, model, api_key, max_tokens, temperature, timeout, enabled
+- `ProviderUpdate` — all fields optional (partial update)
+- `DefaultProviderSet` — provider_id (str or None for fallback clear)
 
 ### `prompt_engineer.py` — Prompt Templates
 
@@ -123,19 +139,69 @@ Builds context-aware prompts for the three follow-up modes:
 
 ### `llm_bridge.py` — LLM Integration
 
-Calls an OpenAI-compatible LLM server (default: chimera AI server at `192.168.1.221:8080`).
+Contains the OpenAI-compatible provider and the provider registry that manages all LLM providers.
 
-**`LocalLLMQueue`**:
+**`OpenAICompatibleProvider`** (renamed from `LocalLLMQueue`):
 - Two modes: `submit()` (non-streaming) and `stream()` (SSE streaming async generator)
 - Uses `urllib.request` (no external dependencies)
 - Runs blocking HTTP call in thread executor, bridges to async via `asyncio.Queue` + `loop.call_soon_threadsafe()`
 - Streaming yields events: `("thinking", "")`, `("token", chunk)`, `("done", full_text)`, `("error", msg)`
+- `api_key` parameter → `Authorization: Bearer {key}` header when non-empty
+- URL auto-normalization: `_normalize_url()` appends `/v1/chat/completions` to bare host URLs
+- `test()` method for connectivity validation
+- Configurable `max_tokens`, `temperature`, `timeout`, `provider_id`
+
+**`ProviderRegistry`**:
+- Manages instantiated LLM provider instances from settings
+- `_create(config)` factory method: `openai-compatible` → `OpenAICompatibleProvider`, `claude-cli` → `ClaudeCLIProvider`
+- `get(id)` — specific provider, `get_default()` — default provider, `get_fallback()` — fallback or None
+- `refresh()` — rebuilds from current settings (called after settings mutations)
 
 **Thinking token detection and filtering:**
 - `_strip_thinking(text)` — removes `<think>...</think>`, `<|channel|>final<|message|>` sequences, remaining `<|...|>` tokens, and bare "analysis" prefix
 - `_has_thinking(text)` — detects thinking content onset for streaming phase transitions
 - Streaming uses a phase state machine: `detecting` → `thinking` → `content`
 - Non-streaming fallback when server returns `application/json` instead of `text/event-stream`
+
+### `claude_cli_provider.py` — Claude Code CLI Integration
+
+Calls Claude via the `claude` CLI binary, enabling use of an existing Claude Code subscription without an API key.
+
+- Uses `asyncio.create_subprocess_exec` (not shell) — args as list, prompt via stdin pipe (no shell injection)
+- CLI command: `['claude', '-p', '--output-format', 'json', '--tools', '', '--model', <model>]`
+- Model name normalization: `MODEL_ALIASES` dict maps variations ("Opus 4.6", "claude opus", "claude-opus-4-6") to CLI short names ("opus", "sonnet", "haiku")
+- `stream()` wraps the non-streaming subprocess for SSE compatibility: emits `("thinking", "")` → `("token", full_text)` → `("done", full_text)`
+- Error handling includes stdout fallback when stderr is empty
+- `test()` validates CLI binary exists and responds
+
+### `settings_manager.py` — Provider Settings Persistence
+
+File-based JSON persistence for LLM provider configuration.
+
+**Storage:** `settings/providers.json` (gitignored to protect API keys)
+
+**Provider config structure:**
+```json
+{
+  "default_provider_id": "local-llm",
+  "fallback_provider_id": "claudecode",
+  "providers": {
+    "local-llm": {
+      "id": "local-llm", "alias": "OSS120", "type": "openai-compatible",
+      "url": "http://192.168.1.221:8081/v1/chat/completions",
+      "model": "gpt-oss-120b", "api_key": "", "enabled": true,
+      "max_tokens": 30000, "temperature": 0.7, "timeout": 300
+    }
+  }
+}
+```
+
+**Key behaviors:**
+- API key masking: `_mask_key()` returns `"sk-...xxxx"` format; keys never sent unmasked to frontend
+- Update handling: detects masked key values and preserves existing key
+- First-run seeding: if no settings file exists, creates one from `--llm-url`/`--llm-model` CLI args
+- Slug ID generation from provider alias (e.g., "My Provider" → "my-provider")
+- Default/fallback provider selection and clearing on delete
 
 ### `session_manager.py` — Session Persistence
 
@@ -226,26 +292,32 @@ All frontend code is vanilla JavaScript using the module pattern (IIFE returning
 │ <main#main-area>                                    │
 │   ├── top-bar                                       │
 │   │   ├── prompt input + send button                │
+│   │   ├── provider dropdown (select AI provider)    │
 │   │   ├── session name display                      │
-│   │   └── zoom controls + theme toggle              │
+│   │   └── settings gear + zoom + theme toggle       │
 │   ├── canvas-viewport                               │
 │   │   └── canvas-world (CSS transform for pan/zoom) │
 │   │       ├── svg#edge-layer (Bezier edges)         │
 │   │       └── .lt-node elements (appended by JS)    │
-│   └── context-menu (hidden, shown on right-click)   │
-│       ├── Explain in Context                        │
-│       ├── Dig Deeper                                │
-│       └── Ask a Question                            │
+│   ├── context-menu (hidden, shown on right-click)   │
+│   │   ├── Explain in Context                        │
+│   │   ├── Dig Deeper                                │
+│   │   └── Ask a Question                            │
+│   └── settings-overlay (hidden, full-page modal)    │
+│       ├── settings-backdrop                         │
+│       └── settings-panel (provider list/forms)      │
 └────────────────────────────────────────────────────┘
 ```
 
 ### `app.js` — Application Controller
 
 Wires everything together on `DOMContentLoaded`:
-- Initializes all modules: `Canvas.init()`, `EdgeRenderer.init()`, `Session.init()`, `ContextMenu.init()`
+- Initializes all modules: `Canvas.init()`, `EdgeRenderer.init()`, `Session.init()`, `ContextMenu.init()`, `Settings.init()`
 - Theme toggle (persisted to `localStorage`)
 - Prompt input handling (Enter to submit)
-- Keyboard shortcuts (Escape to hide context menu, Ctrl+S to save)
+- Keyboard shortcuts (Escape to hide context menu + settings overlay, Ctrl+S to save)
+- Provider dropdown population with localStorage persistence
+- Settings button wiring
 
 **Core workflows:**
 
@@ -254,7 +326,9 @@ Wires everything together on `DOMContentLoaded`:
 3. **Auto-title**: On first prompt, calls `/api/generate-title` to name the session
 
 **SSE streaming (`streamQueryToNode`):**
-- Receives events from `API.streamQuery()`: `onPrompt`, `onThinking`, `onToken`, `onDone`, `onError`
+- Injects `provider_id` from dropdown selection into query
+- Receives events from `API.streamQuery()`: `onPrompt`, `onThinking`, `onToken`, `onDone`, `onError`, `onFallback`
+- `onFallback` shows a toast notification when fallback provider is activated
 - `onPrompt` stores the engineered prompt in `engineered_prompt` field (separate from `prompt_text`)
 - `onToken` calls `NodeRenderer.streamToken()` for progressive markdown rendering
 - `onDone` calls `NodeRenderer.finishStreaming()` for final render with full features
@@ -455,7 +529,28 @@ Manages the session lifecycle and sidebar UI.
 
 Simple fetch wrappers for all backend endpoints. All requests use JSON content type. Errors throw with status code and message.
 
-**`streamQuery(data, callbacks)`**: SSE streaming consumer for the primary query path. Uses `fetch` + `response.body.getReader()` + `TextDecoder` to parse SSE events line-by-line. Dispatches to callbacks: `onPrompt`, `onThinking`, `onToken`, `onDone`, `onError`. Handles remaining buffer data after stream ends.
+**`streamQuery(data, callbacks)`**: SSE streaming consumer for the primary query path. Uses `fetch` + `response.body.getReader()` + `TextDecoder` to parse SSE events line-by-line. Dispatches to callbacks: `onPrompt`, `onThinking`, `onToken`, `onDone`, `onError`, `onFallback`. Handles remaining buffer data after stream ends.
+
+**Settings API wrappers:** `getProviderList`, `getProviders`, `addProvider`, `updateProvider`, `deleteProvider`, `testProvider`, `setDefaultProvider`, `setFallbackProvider` — all JSON fetch wrappers for the `/api/settings/*` endpoints.
+
+### `settings.js` — Settings Overlay
+
+IIFE module managing the full-page settings overlay for LLM provider configuration.
+
+**Provider list view:**
+- Cards per provider: alias, type badge (CLI/API), URL/model details, DEFAULT/FALLBACK badges
+- Action buttons: Test, Edit, Set Default (shows "Is Default" disabled for current), Delete
+- "+ Add Provider" button at top
+- Fallback provider dropdown at bottom
+
+**Add/Edit form:**
+- Fields: Alias, Type (openai-compatible / claude-cli), URL, Model, API Key, Max Tokens, Temperature, Timeout, Enabled
+- Type-dependent visibility: claude-cli hides URL and API Key fields
+- Password field placeholder shows "(unchanged)" for existing providers
+
+**Test connectivity:**
+- POSTs to `/api/settings/providers/{id}/test`
+- Inline result display: green for success (with response preview), red for error
 
 ---
 
@@ -495,6 +590,14 @@ background-size: 30px 30px;
 | `.section-fade` | Gradient overlay at bottom of collapsed sections |
 | `.canvas-viewport.panning` | Grabbing cursor during pan |
 | `.canvas-viewport.zooming` | Zoom-in cursor during wheel zoom |
+| `.provider-select` | Provider dropdown in top bar |
+| `.settings-overlay` | Full-page settings modal container |
+| `.settings-panel` | Settings content panel (centered) |
+| `.provider-card` | Individual provider card in settings |
+| `.provider-badge-default` | Green "DEFAULT" badge |
+| `.provider-badge-fallback` | Blue "FALLBACK" badge |
+| `.provider-test-result` | Inline test result display |
+| `.toast` | Auto-dismissing notification bar |
 
 ---
 
@@ -512,7 +615,7 @@ App.submitInitialPrompt()
   ├── streamQueryToNode() → API.streamQuery() → POST /api/query/stream
   │       │
   │       ▼
-  │   app.py: build_prompt() → LocalLLMQueue.stream() (async generator)
+  │   app.py: build_prompt() → ProviderRegistry.get(provider_id).stream()
   │       │
   │       ▼  SSE events flow back to frontend:
   │   event: prompt  → stores engineered_prompt (separate from prompt_text)
@@ -563,7 +666,9 @@ ContextMenu.handleAction()
 - No other dependencies — vanilla JS
 
 **External services:**
-- OpenAI-compatible LLM server (default: chimera AI server at `192.168.1.221:8080`)
+- Any OpenAI-compatible LLM server (configured via settings UI)
+- Claude Code CLI binary (optional, for Claude Code subscription users)
+- Default: chimera AI orchestrator at `192.168.1.221:8081` with web search, model `gpt-oss-120b`
 
 ---
 
@@ -571,23 +676,26 @@ ContextMenu.handleAction()
 
 ```
 LearningSystem/
-├── app.py                     # FastAPI server, routes, SSE streaming endpoint
+├── app.py                     # FastAPI server, routes, SSE streaming, settings endpoints
 ├── models.py                  # Pydantic request/response models
 ├── prompt_engineer.py         # Prompt templates with lineage context
-├── llm_bridge.py              # Async LLM bridge (OpenAI-compatible API)
+├── llm_bridge.py              # OpenAICompatibleProvider, ProviderRegistry
+├── claude_cli_provider.py     # Claude Code CLI subprocess integration
+├── settings_manager.py        # Provider settings persistence (JSON)
 ├── session_manager.py         # File-based session CRUD + trash
 ├── static/
 │   ├── index.html             # Single-page HTML shell
 │   ├── css/
 │   │   └── main.css           # All styles, dark/light themes
 │   ├── js/
-│   │   ├── api.js             # Fetch wrappers + SSE streaming consumer
-│   │   ├── app.js             # Main controller, wiring, workflows
+│   │   ├── api.js             # Fetch wrappers + SSE + settings API
+│   │   ├── app.js             # Main controller, provider dropdown
 │   │   ├── canvas.js          # Infinite canvas pan/zoom
 │   │   ├── context_menu.js    # Text selection, highlighting, actions
 │   │   ├── edge.js            # SVG Bezier edge rendering
 │   │   ├── node.js            # Node DOM, drag, resize, streaming, math
 │   │   ├── session.js         # Session CRUD, sidebar UI, auto-save
+│   │   ├── settings.js        # Settings overlay UI (provider management)
 │   │   └── marked.min.js      # Vendored markdown parser
 │   └── vendor/
 │       └── katex/             # Vendored KaTeX v0.16.21 (math rendering)
@@ -595,6 +703,8 @@ LearningSystem/
 │           ├── katex.min.js
 │           ├── contrib/auto-render.min.js
 │           └── fonts/         # 60 font files
+├── settings/                  # Provider config (gitignored, contains API keys)
+│   └── providers.json         # Provider definitions + default/fallback
 ├── learning_sessions/         # Active session data (JSON files)
 ├── learning_sessions_trash/   # Soft-deleted sessions (30-day retention)
 └── development-docs/          # This documentation

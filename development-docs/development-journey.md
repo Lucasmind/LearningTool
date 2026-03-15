@@ -922,6 +922,107 @@ Revealed the deeper issue: highlights were being created correctly in the DOM, b
 
 ---
 
+## Phase 31: Multi-LLM Provider Settings System
+
+### Prompt #50 — Deep Competitive Research
+> "I need you to perform a deep web research on this project. I think this UI metaphor for interacting and learning with LLMs is relatively unique and I want to see if there is an open source product OR a paid product or both that already implements this."
+
+Extensive web research across product directories, GitHub, Reddit, and tech publications. Found several competitors in the "node-graph AI canvas" space including Mindmac, Graphologue, Athena, and others — but confirmed the Learning Tool's specific combination of text-highlight-to-spawn-child-node interaction was relatively unique among existing tools.
+
+### Prompt #51 — Strategic Differentiators & Open Source Strategy
+> "Given what you know about our platform, and what you know about the competitors. What other differentiators should we implement? Is the space too busy to warrant a paid offering or should we open source and reap the rewards that way building our reputation."
+
+Provided strategic analysis: recommended open-sourcing to build reputation in a space dominated by well-funded competitors, with potential for premium features later. Key differentiator suggestions included multi-LLM provider support, collaborative sessions, and export capabilities.
+
+### Prompt #52 — Multi-Provider Settings Plan
+> "Can you make a plan to incorporate LLM settings into the Learning tool? Specifically I would like to support adding multiple compatible APIs that we can call. So for example I would like the tool to be able to access Google Gemini, OpenAI, Claude, Deepseek etc... through API as well as local AI (like we have right now), I would also like to have a feature that you can turn on so that if you have Claude Code on your machine hosting the system that you can use the command line prompt flag to pass a request to and get a response..."
+
+Created a comprehensive implementation plan covering:
+- **Settings persistence**: File-based JSON in `settings/providers.json` with API key masking
+- **Provider types**: OpenAI-compatible API + Claude Code CLI subprocess integration
+- **Provider registry**: Factory pattern creating the right provider class from config
+- **Settings UI**: Full overlay with provider cards, add/edit forms, test connectivity
+- **Provider dropdown**: In-page selector with localStorage persistence
+- **Fallback logic**: Automatic retry with fallback provider on failure
+
+### Prompt #53 — GitHub Repository & Implementation
+> "Can you create a GitHub repo in my Lucasmind github for this project. Make it public. Make sure nothing secure is pushed to github."
+
+Created public repository at `Lucasmind/LearningTool` on GitHub. Added `settings/` to `.gitignore` to prevent API keys from being committed. Then proceeded with full implementation of the multi-provider system.
+
+### Implementation
+
+**New files created:**
+
+**`settings_manager.py`** — Settings persistence and provider CRUD:
+- File-based JSON storage in `settings/providers.json`
+- Provider add/update/delete with auto-generated slug IDs from aliases
+- API key masking (`"sk-...xxxx"` format) — keys never sent unmasked to frontend
+- First-run seeding from `--llm-url`/`--llm-model` CLI args; subsequent runs use persisted settings
+- Default and fallback provider selection
+
+**`claude_cli_provider.py`** — Claude Code CLI subprocess integration:
+- Uses `asyncio.create_subprocess_exec` (not shell) to safely invoke the `claude` binary
+- Prompt passed via stdin pipe, never interpolated into the command (no shell injection)
+- Model name normalization via `MODEL_ALIASES` dict: "Opus 4.6" → "opus", "Claude Sonnet" → "sonnet"
+- CLI command: `['claude', '-p', '--output-format', 'json', '--tools', '', '--model', self._model]`
+- `stream()` emits `("thinking", "")` → `("token", full_text)` → `("done", full_text)` for SSE compatibility with the non-streaming subprocess
+- `test()` validates binary exists and responds
+
+**`static/js/settings.js`** — Settings overlay UI (IIFE module):
+- Provider list view with cards showing alias, type badge (CLI/API), URL/model, DEFAULT/FALLBACK badges
+- Action buttons per card: Test, Edit, Set Default, Delete
+- Add/Edit form with type-dependent field visibility (claude-cli hides URL/API key fields)
+- Fallback provider dropdown at bottom
+- Test results displayed inline with success (green) or error (red) styling
+
+**Modified files:**
+
+**`llm_bridge.py`**:
+- Renamed `LocalLLMQueue` → `OpenAICompatibleProvider` (backward-compat alias retained)
+- Added `api_key` parameter → `Authorization: Bearer {key}` header
+- Added `provider_id` attribute, `max_tokens`/`temperature` as constructor params
+- Added URL auto-normalization: bare host → `/v1/chat/completions` path
+- Added `test()` method for connectivity testing
+- Added `ProviderRegistry` class with factory method creating `OpenAICompatibleProvider` or `ClaudeCLIProvider` based on config type
+
+**`app.py`**:
+- Replaced `chat_queue`/`_title_llm` globals with `SettingsManager` + `ProviderRegistry`
+- Added `_get_provider(provider_id)` helper
+- Stream query resolves provider from `req.provider_id` or uses default
+- Fallback logic: on error, emits `event: fallback` SSE event, retries with fallback provider
+- 8 new settings API endpoints (CRUD, test, default/fallback, provider-list for dropdown)
+
+**`models.py`**: Added `provider_id: Optional[str] = None` to `QueryRequest`, plus `ProviderCreate`, `ProviderUpdate`, `DefaultProviderSet` Pydantic models
+
+**`static/js/api.js`**: Added 8 settings API wrappers, `onFallback` callback in SSE parser
+
+**`static/js/app.js`**: Provider dropdown population with localStorage persistence, settings button wiring, `provider_id` injection into queries, fallback toast notification, `showToast()` function
+
+**`static/index.html`**: Provider dropdown select, settings gear button, settings overlay div with backdrop/panel, `settings.js` script tag
+
+**`static/css/main.css`**: Styles for provider dropdown, settings overlay, provider cards, form inputs, test results, badges, toast notifications
+
+### Prompt #54 — Claude CLI Error Fix
+> "Trying out the new settings. Looking good, I tested the Claude CLI and it gave me an error. Also it seems the set default button doesn't work I click it but nothing happens."
+
+**Two bugs found and fixed:**
+
+1. **Claude CLI model name**: The CLI expects short names like "opus" but the settings had "Opus 4.6". Added `MODEL_ALIASES` dictionary and `_normalize_model()` classmethod to handle all common variations. Also fixed error reporting — when stderr was empty (which it was), stdout output wasn't being shown. Added fallback: `detail = err or out or "(no output)"`.
+
+2. **Set Default button UX**: The button appeared to do nothing because there was no visual feedback. Added `try/catch` with `alert()` on failure. Changed the button for the current default from "Set Default" to "Is Default" (disabled, `opacity: 0.5`) for clear visual distinction.
+
+### Prompt #55 — OSS120 Connection Fix
+> "I am testing the OSS120 entry right now using the test button and it isn't working. On chimera where OSS is hosted we have front ended it with an orchestrator..."
+
+The user's OSS120 provider had two issues:
+1. **URL**: `http://192.168.1.221:8081` missing the `/v1/chat/completions` path
+2. **Model name**: `"OpenAI oss-120b"` instead of `"gpt-oss-120b"` (the orchestrator requires this exact name)
+
+Fixed the settings file directly. Then added URL auto-normalization in `OpenAICompatibleProvider._normalize_url()` so users can enter bare URLs (e.g., `http://server:8081`) and the path is auto-appended. The chimera orchestrator at `192.168.1.221:8081` provides web search capability and supports up to 120k context window with model name `gpt-oss-120b`.
+
+---
+
 ## Summary of All User Prompts (Chronological)
 
 | # | Prompt Summary | Phase |
@@ -975,23 +1076,33 @@ Revealed the deeper issue: highlights were being created correctly in the DOM, b
 | 47 | Multi-line highlights create empty gaps between bullet lines | 30 |
 | 48 | First fix broke all multi-line highlighting | 30 |
 | 49 | Still broken — deeper issue with highlight reapply after re-render | 30 |
+| 50 | Deep competitive research on node-graph AI canvas products | 31 |
+| 51 | Strategic differentiators and open source vs paid analysis | 31 |
+| 52 | Multi-LLM provider settings plan (API + Claude CLI) | 31 |
+| 53 | Create GitHub repo + implement multi-provider system | 31 |
+| 54 | Fix Claude CLI model name error + Set Default button UX | 31 |
+| 55 | Fix OSS120 connection (URL normalization + model name) | 31 |
 
 ## Summary of All Changes by File
 
 | File | Changes |
 |------|---------|
-| `app.py` | Trash cleanup on startup, trash API endpoints, title generation endpoint, CLI args, dual-method PUT/POST save endpoint for sendBeacon (Phase 18), removed SalesChat/mock mode, added SSE streaming endpoint `/api/query/stream`, Pydantic v1 `.dict()` fix (Phase 23, 25) |
-| `models.py` | Added `width`, `height`, `prompt_collapsed`, `response_collapsed` to `NodeData` (Phase 12) |
+| `app.py` | Trash cleanup on startup, trash API endpoints, title generation endpoint, CLI args, dual-method PUT/POST save endpoint for sendBeacon (Phase 18), removed SalesChat/mock mode, added SSE streaming endpoint `/api/query/stream`, Pydantic v1 `.dict()` fix (Phase 23, 25), replaced `chat_queue`/`_title_llm` with `SettingsManager` + `ProviderRegistry`, 8 new settings API endpoints, provider-aware query routing with fallback logic (Phase 31) |
+| `models.py` | Added `width`, `height`, `prompt_collapsed`, `response_collapsed` to `NodeData` (Phase 12), added `provider_id` to `QueryRequest`, `ProviderCreate`, `ProviderUpdate`, `DefaultProviderSet` models (Phase 31) |
 | `prompt_engineer.py` | Three prompt modes with lineage context. Now reads short `prompt_text` (user-facing) instead of full engineered prompts — enables linear context growth (Phase 29) |
-| `llm_bridge.py` | Renamed from `saleschat_bridge.py`. Removed `SalesChatQueue` class. `LocalLLMQueue` with non-streaming `submit()` and streaming `stream()` async generator. `_strip_thinking()` for multi-format thinking token removal. `_has_thinking()` for streaming detection. Non-streaming fallback when server doesn't support SSE (Phases 23-25) |
+| `llm_bridge.py` | Renamed from `saleschat_bridge.py`. Removed `SalesChatQueue` class. `OpenAICompatibleProvider` (renamed from `LocalLLMQueue`) with non-streaming `submit()` and streaming `stream()` async generator. `_strip_thinking()` for multi-format thinking token removal. `_has_thinking()` for streaming detection. Non-streaming fallback when server doesn't support SSE (Phases 23-25). Added `api_key` header support, URL auto-normalization, `test()` method, `ProviderRegistry` with factory method (Phase 31) |
+| `claude_cli_provider.py` | **New (Phase 31)** — Claude Code CLI subprocess integration via `asyncio.create_subprocess_exec`, model name normalization, SSE-compatible streaming wrapper |
+| `settings_manager.py` | **New (Phase 31)** — Settings persistence, provider CRUD, API key masking, first-run seeding from CLI args |
 | `session_manager.py` | Added soft-delete, trash CRUD, 30-day auto-cleanup |
-| `static/index.html` | Added trash section in sidebar, KaTeX CSS/JS includes (Phase 27) |
-| `static/css/main.css` | Resize handles, cursor classes, scroll containers, fade overlays, trash styles, transparency, highlight colors, streaming cursor animation (Phase 25), KaTeX display math scroll and font sizing (Phase 27), `.badge-question-text` styling for question node headers (Phase 28), defensive hide rules for stray highlight marks in block containers (Phase 30) |
-| `static/js/api.js` | Added trash, title generation, and `streamQuery()` SSE streaming endpoints (Phase 25) |
-| `static/js/app.js` | Auto-title generation on first prompt, tree-layout child positioning with collision avoidance (Phase 11), replaced polling with `streamQueryToNode()` SSE streaming (Phase 25), `user_question` field + badge text for question nodes (Phase 28), separated `engineered_prompt` from `prompt_text` storage for linear context growth (Phase 29) |
+| `static/index.html` | Added trash section in sidebar, KaTeX CSS/JS includes (Phase 27), provider dropdown, settings button, settings overlay div, settings.js script tag (Phase 31) |
+| `static/css/main.css` | Resize handles, cursor classes, scroll containers, fade overlays, trash styles, transparency, highlight colors, streaming cursor animation (Phase 25), KaTeX display math scroll and font sizing (Phase 27), `.badge-question-text` styling for question node headers (Phase 28), defensive hide rules for stray highlight marks in block containers (Phase 30), provider dropdown, settings overlay, provider cards, form inputs, test results, badges, toast notifications (Phase 31) |
+| `static/js/api.js` | Added trash, title generation, and `streamQuery()` SSE streaming endpoints (Phase 25), 8 settings API wrappers, `onFallback` callback in SSE parser (Phase 31) |
+| `static/js/app.js` | Auto-title generation on first prompt, tree-layout child positioning with collision avoidance (Phase 11), replaced polling with `streamQueryToNode()` SSE streaming (Phase 25), `user_question` field + badge text for question nodes (Phase 28), separated `engineered_prompt` from `prompt_text` storage for linear context growth (Phase 29), provider dropdown with localStorage persistence, settings button, `provider_id` injection, fallback toast, `showToast()` (Phase 31) |
+| `static/js/settings.js` | **New (Phase 31)** — Settings overlay IIFE module: provider list/cards, add/edit forms, test connectivity, default/fallback selection |
 | `static/js/canvas.js` | Native scroll pass-through, zoom cursor feedback, `findScrollableAncestor()` with overflow-y check, scroll absorption on collapsed nodes (Phases 14-15, 17), viewport save on pan/zoom (Phase 18), reduced `ZOOM_STEP` 0.1→0.04 (Phase 19) |
 | `static/js/context_menu.js` | Highlight creation, targeted whitespace node filtering for cross-element selections (Phase 30) |
 | `static/js/edge.js` | Collapsed mark detection, scroll-aware clamping against response section bounds (Phases 6, 10, 17) |
 | `static/js/node.js` | Toggle buttons, resize handles, HTML restructure, scroll listeners, `ResizeObserver` for edge redraws, `rebuildInnerHTML()` for collapse/expand toggle, state persistence, drag fixes (Phases 7-10, 13, 16), `normalizeMarkdown()` text cleanup + `renderResponse()` priority flip (Phase 22), table-row exclusion in sub-header detection (Phase 26), `streamToken()` and `finishStreaming()` for progressive streaming display (Phase 25), `renderMath()` + `parseMdWithMath()` for KaTeX LaTeX rendering with placeholder protection from marked.js (Phase 27), question text in badge header + `engineered_prompt` display in prompt section + force collapse on running status (Phases 28-29), `findAndWrapText()` whitespace-normalized fallback for cross-element highlight reapply (Phase 30) |
 | `static/vendor/katex/` | Vendored KaTeX v0.16.21 — CSS, JS, auto-render extension, 60 font files (Phase 27) |
 | `static/js/session.js` | DOM state capture in save, trash UI, restore, multi-pass edge redraw on load (Phase 13), `flushSave()` before session switch, `beforeunload` + `sendBeacon` for reliable save on page close (Phase 18) |
+| `.gitignore` | Added `settings/` to prevent API keys from being committed (Phase 31) |

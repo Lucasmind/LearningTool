@@ -54,7 +54,8 @@ class ClaudeCLIProvider:
         cmd = [
             "claude", "-p",
             "--output-format", "json",
-            "--tools", "",
+            "--tools", "WebSearch,WebFetch,Agent",
+            "--permission-mode", "bypassPermissions",
             "--model", self._model,
         ]
 
