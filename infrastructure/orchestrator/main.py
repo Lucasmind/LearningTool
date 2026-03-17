@@ -1,10 +1,19 @@
 """
-LLM Orchestrator with Web Search
+LearningTool Orchestrator with Web Search
 
 Agentic proxy that sits between clients and llama-server, executing
 browser tool calls (search/open/find) against SearXNG and web pages.
 
 Exposes an OpenAI-compatible /v1/chat/completions endpoint on port 8081.
+
+Configuration via environment variables:
+    LLAMA_URL          - Primary llama-server URL (default: http://llama-server:8080)
+    LLAMA_URLS         - Comma-separated list of backend URLs for failover
+    SEARXNG_URL        - SearXNG search engine URL (default: http://searxng:8080)
+    MAX_TOOL_ROUNDS    - Max agentic tool-call rounds (default: 8)
+    SEARCH_RESULTS_COUNT - Number of search results to return (default: 5)
+    PAGE_CACHE_SIZE    - LRU cache size for fetched pages (default: 20)
+    REQUEST_TIMEOUT    - HTTP request timeout in seconds (default: 300)
 """
 
 import os
@@ -23,7 +32,7 @@ from bs4 import BeautifulSoup
 # Configuration
 # ---------------------------------------------------------------------------
 
-LLAMA_URL = os.getenv("LLAMA_URL", "http://oss-120b-vulkan:8080")
+LLAMA_URL = os.getenv("LLAMA_URL", "http://llama-server:8080")
 LLAMA_URLS = [u.strip() for u in os.getenv("LLAMA_URLS", LLAMA_URL).split(",")]
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
@@ -31,62 +40,33 @@ SEARCH_RESULTS_COUNT = int(os.getenv("SEARCH_RESULTS_COUNT", "5"))
 PAGE_CACHE_SIZE = int(os.getenv("PAGE_CACHE_SIZE", "20"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
 
-# Model type detection: maps base URL -> "harmony" or "standard"
-_backend_type_cache: dict[str, str] = {}
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orchestrator")
 
-app = FastAPI(title="LLM Orchestrator with Web Search")
+app = FastAPI(title="LearningTool Orchestrator with Web Search")
 
 
 # ---------------------------------------------------------------------------
-# Backend discovery — find a healthy llama-server and detect model type
+# Backend discovery — find a healthy llama-server
 # ---------------------------------------------------------------------------
 
 
-async def get_active_backend() -> tuple[str, str]:
-    """
-    Return (base_url, model_type) for the first healthy backend.
-    model_type is 'harmony' for gpt-oss-120b or 'standard' for others (Nemotron, etc).
-    """
+async def get_active_backend() -> str:
+    """Return the base URL for the first healthy backend."""
     async with httpx.AsyncClient() as client:
         for url in LLAMA_URLS:
             try:
                 r = await client.get(f"{url}/health", timeout=5.0)
                 if r.status_code == 200:
-                    model_type = await _detect_model_type(client, url)
-                    log.info("Using backend %s (model type: %s)", url, model_type)
-                    return url, model_type
+                    log.info("Using backend %s", url)
+                    return url
             except Exception:
                 log.debug("Backend %s not reachable", url)
                 continue
 
     # Fall back to first URL even if unhealthy
     log.warning("No healthy backend found, falling back to %s", LLAMA_URLS[0])
-    return LLAMA_URLS[0], "standard"
-
-
-async def _detect_model_type(client: httpx.AsyncClient, base_url: str) -> str:
-    """Detect whether the backend is running a harmony-format model or standard."""
-    if base_url in _backend_type_cache:
-        return _backend_type_cache[base_url]
-
-    try:
-        r = await client.get(f"{base_url}/v1/models", timeout=10.0)
-        if r.status_code == 200:
-            data = r.json()
-            models = data.get("data", [])
-            for m in models:
-                model_id = m.get("id", "").lower()
-                if "oss" in model_id or "gpt-oss" in model_id:
-                    _backend_type_cache[base_url] = "harmony"
-                    return "harmony"
-    except Exception:
-        pass
-
-    _backend_type_cache[base_url] = "standard"
-    return "standard"
+    return LLAMA_URLS[0]
 
 # ---------------------------------------------------------------------------
 # Page cache (LRU) for browser.open / browser.find
@@ -290,37 +270,6 @@ TOOL_DISPATCH = {
 }
 
 # ---------------------------------------------------------------------------
-# Harmony token cleanup (from scripts/llm-proxy.py)
-# ---------------------------------------------------------------------------
-
-
-def extract_final_content(text: str) -> str:
-    """Extract final channel content and strip harmony tokens."""
-    if not text:
-        return text
-
-    # Try to extract final channel
-    final_match = re.search(
-        r"<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|$)", text, re.DOTALL
-    )
-    if final_match:
-        return final_match.group(1).strip()
-
-    # Remove analysis/commentary channels
-    cleaned = re.sub(
-        r"<\|channel\|>(?:analysis|commentary)<\|message\|>.*?<\|end\|>",
-        "",
-        text,
-        flags=re.DOTALL,
-    )
-    # Remove any remaining harmony tags
-    cleaned = re.sub(r"<\|[^|]+\|>", "", cleaned)
-    cleaned = cleaned.strip()
-
-    return cleaned if cleaned else text
-
-
-# ---------------------------------------------------------------------------
 # Search intent classification (Option C: keyword heuristic + ambiguous)
 # ---------------------------------------------------------------------------
 
@@ -475,10 +424,10 @@ async def agentic_chat(request_body: dict) -> dict:
     """
     Forward request to llama-server with browser tools.
     Execute tool calls in a loop until the model returns a final response.
-    Automatically detects which backend is available and adapts cleanup logic.
+    Automatically detects which backend is available.
     """
-    backend_url, model_type = await get_active_backend()
-    log.info("Agentic chat using backend %s (%s)", backend_url, model_type)
+    backend_url = await get_active_backend()
+    log.info("Agentic chat using backend %s", backend_url)
 
     messages = list(request_body.get("messages", []))
     original_max_tokens = request_body.get("max_tokens")
@@ -534,7 +483,7 @@ async def agentic_chat(request_body: dict) -> dict:
         tool_calls = assistant_msg.get("tool_calls")
 
         if not tool_calls:
-            return await _cleanup_response(result, model_type, messages, request_body, backend_url)
+            return await _cleanup_response(result, messages, request_body, backend_url)
 
         # Model wants to call tools
         log.info(
@@ -590,41 +539,21 @@ async def agentic_chat(request_body: dict) -> dict:
     return await _get_final_answer(request_body, messages, backend_url)
 
 
-async def _cleanup_response(result: dict, model_type: str, messages: list,
+async def _cleanup_response(result: dict, messages: list,
                             request_body: dict, backend_url: str) -> dict:
     """
-    Clean up a final model response. For harmony models (gpt-oss-120b),
-    strip harmony tokens and handle reasoning_content. For standard models
-    (Nemotron, etc.), just pass through with minimal cleanup.
+    Clean up a final model response: fall back to reasoning_content if
+    content is empty, then strip reasoning_content from the response.
     """
     choice = result["choices"][0]
     assistant_msg = choice["message"]
     content = assistant_msg.get("content") or ""
     reasoning = assistant_msg.get("reasoning_content") or ""
 
-    if model_type == "harmony":
-        # Harmony-format model: extract final channel, strip tags
-        if content:
-            cleaned = extract_final_content(content)
-            assistant_msg["content"] = cleaned if cleaned else content
-        elif reasoning and not content:
-            log.info("Content empty but reasoning_content present, using reasoning")
-            assistant_msg["content"] = extract_final_content(reasoning) or reasoning
-
-        # Check if content is still empty or just reasoning echoed
-        content = assistant_msg.get("content") or ""
-        if not content or content == reasoning:
-            log.info("Model response looks like reasoning, requesting explicit final answer")
-            messages.append(assistant_msg)
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Please write your final response to my original question "
-                    "using all the information you gathered from your searches. "
-                    "Include relevant URLs as references."
-                ),
-            })
-            return await _get_final_answer(request_body, messages, backend_url)
+    # If content is empty but reasoning_content is present, use it as fallback
+    if not content and reasoning:
+        log.info("Content empty but reasoning_content present, using reasoning")
+        assistant_msg["content"] = reasoning
 
     # Strip reasoning_content to prevent it showing in Open WebUI
     if "reasoning_content" in assistant_msg:
@@ -653,17 +582,9 @@ async def _get_final_answer(request_body: dict, messages: list,
         content = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or ""
 
-        # Clean harmony tokens from content
-        if content:
-            cleaned = extract_final_content(content)
-            msg["content"] = cleaned if cleaned else content
-
-        # If content is empty or identical to reasoning (model stayed in analysis mode),
-        # the model didn't produce a proper final answer — use reasoning as fallback
-        content = msg.get("content") or ""
-        if not content or content == reasoning:
-            if reasoning:
-                msg["content"] = extract_final_content(reasoning) or reasoning
+        # If content is empty, use reasoning_content as fallback
+        if not content and reasoning:
+            msg["content"] = reasoning
 
         # Strip the reasoning_content from the response to prevent Open WebUI
         # from displaying it as the primary response
@@ -752,7 +673,7 @@ async def stream_direct(request_body: dict, backend_url: str,
         yield chunk
 
 
-async def stream_agentic(request_body: dict, backend_url: str, model_type: str,
+async def stream_agentic(request_body: dict, backend_url: str,
                           strip_reasoning: bool = True):
     """
     Run tool rounds non-streaming, then stream the final answer.
@@ -915,7 +836,7 @@ async def direct_chat(request_body: dict, skip_thinking: bool = False) -> dict:
     Forward request directly to llama-server WITHOUT tools (non-streaming).
     Used for non-streaming requests or as fallback.
     """
-    backend_url, model_type = await get_active_backend()
+    backend_url = await get_active_backend()
     log.info("Direct chat (no search%s) using backend %s",
              ", no-think" if skip_thinking else "", backend_url)
 
@@ -934,14 +855,6 @@ async def direct_chat(request_body: dict, skip_thinking: bool = False) -> dict:
         resp.raise_for_status()
 
     result = resp.json()
-
-    # Apply harmony cleanup if needed
-    if result.get("choices") and model_type == "harmony":
-        msg = result["choices"][0]["message"]
-        content = msg.get("content") or ""
-        if content:
-            cleaned = extract_final_content(content)
-            msg["content"] = cleaned if cleaned else content
 
     # Strip reasoning_content
     if result.get("choices"):
@@ -987,7 +900,7 @@ async def chat_completions(request: Request):
              f" ({skip_reason}, skip thinking)" if skip_reason else "")
 
     # Get active backend
-    backend_url, model_type = await get_active_backend()
+    backend_url = await get_active_backend()
 
     # --- STREAMING PATH ---
     if was_streaming:
@@ -1010,7 +923,7 @@ async def chat_completions(request: Request):
             log.info("Streaming agentic search (reasoning=%s) via %s",
                      stream_reasoning, backend_url)
             return StreamingResponse(
-                stream_agentic(body, backend_url, model_type,
+                stream_agentic(body, backend_url,
                                strip_reasoning=strip_reasoning),
                 media_type="text/event-stream",
             )
@@ -1048,7 +961,7 @@ async def list_models():
 async def proxy(path: str, request: Request):
     """Proxy all other endpoints directly to the active llama-server."""
     try:
-        backend_url, _ = await get_active_backend()
+        backend_url = await get_active_backend()
         body = await request.body()
         headers = {
             k: v for k, v in request.headers.items()
