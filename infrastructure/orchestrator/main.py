@@ -1,13 +1,15 @@
 """
 LearningTool Orchestrator with Web Search
 
-Agentic proxy that sits between clients and llama-server, executing
-browser tool calls (search/open/find) against SearXNG and web pages.
+Agentic proxy that sits between clients and any OpenAI-compatible LLM backend
+(llama.cpp, Ollama, vLLM, etc.), providing web search, thinking mode control,
+and smart request routing.
 
 Exposes an OpenAI-compatible /v1/chat/completions endpoint on port 8081.
 
 Configuration via environment variables:
-    LLAMA_URL          - Primary llama-server URL (default: http://llama-server:8080)
+    LLAMA_URL          - Primary LLM backend URL (default: http://llama-server:8080)
+                         Works with llama.cpp, Ollama (http://host:11434), vLLM, etc.
     LLAMA_URLS         - Comma-separated list of backend URLs for failover
     SEARXNG_URL        - SearXNG search engine URL (default: http://searxng:8080)
     MAX_TOOL_ROUNDS    - Max agentic tool-call rounds (default: 8)
@@ -47,22 +49,31 @@ app = FastAPI(title="LearningTool Orchestrator with Web Search")
 
 
 # ---------------------------------------------------------------------------
-# Backend discovery — find a healthy llama-server
+# Backend discovery — find a healthy LLM backend (llama.cpp, Ollama, vLLM, etc.)
 # ---------------------------------------------------------------------------
+
+
+async def _check_backend_health(client: httpx.AsyncClient, url: str) -> bool:
+    """Check if an LLM backend is healthy. Tries multiple endpoint patterns."""
+    # llama.cpp uses /health
+    for endpoint in [f"{url}/health", f"{url}/v1/models"]:
+        try:
+            r = await client.get(endpoint, timeout=5.0)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 async def get_active_backend() -> str:
     """Return the base URL for the first healthy backend."""
     async with httpx.AsyncClient() as client:
         for url in LLAMA_URLS:
-            try:
-                r = await client.get(f"{url}/health", timeout=5.0)
-                if r.status_code == 200:
-                    log.info("Using backend %s", url)
-                    return url
-            except Exception:
-                log.debug("Backend %s not reachable", url)
-                continue
+            if await _check_backend_health(client, url):
+                log.info("Using backend %s", url)
+                return url
+            log.debug("Backend %s not reachable", url)
 
     # Fall back to first URL even if unhealthy
     log.warning("No healthy backend found, falling back to %s", LLAMA_URLS[0])
@@ -539,11 +550,19 @@ async def agentic_chat(request_body: dict) -> dict:
     return await _get_final_answer(request_body, messages, backend_url)
 
 
+def _strip_think_tags(text: str) -> str:
+    """Strip <think>...</think> blocks from content.
+    Some backends (Ollama, etc.) embed thinking in the content field
+    instead of using a separate reasoning_content field."""
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+
 async def _cleanup_response(result: dict, messages: list,
                             request_body: dict, backend_url: str) -> dict:
     """
     Clean up a final model response: fall back to reasoning_content if
-    content is empty, then strip reasoning_content from the response.
+    content is empty, strip reasoning_content, and remove <think> tags
+    from content (for backends that embed thinking in content).
     """
     choice = result["choices"][0]
     assistant_msg = choice["message"]
@@ -555,9 +574,14 @@ async def _cleanup_response(result: dict, messages: list,
         log.info("Content empty but reasoning_content present, using reasoning")
         assistant_msg["content"] = reasoning
 
-    # Strip reasoning_content to prevent it showing in Open WebUI
+    # Strip reasoning_content to prevent it showing in clients
     if "reasoning_content" in assistant_msg:
         del assistant_msg["reasoning_content"]
+
+    # Strip <think> tags from content (Ollama and other backends that
+    # embed thinking directly in the content field)
+    if assistant_msg.get("content"):
+        assistant_msg["content"] = _strip_think_tags(assistant_msg["content"])
 
     return result
 
@@ -586,10 +610,13 @@ async def _get_final_answer(request_body: dict, messages: list,
         if not content and reasoning:
             msg["content"] = reasoning
 
-        # Strip the reasoning_content from the response to prevent Open WebUI
-        # from displaying it as the primary response
+        # Strip reasoning_content from the response
         if "reasoning_content" in msg:
             del msg["reasoning_content"]
+
+        # Strip <think> tags from content (Ollama and other backends)
+        if msg.get("content"):
+            msg["content"] = _strip_think_tags(msg["content"])
 
     return result
 
@@ -602,11 +629,19 @@ async def _get_final_answer(request_body: dict, messages: list,
 async def _stream_from_backend(backend_url: str, payload: dict,
                                 strip_reasoning: bool = True):
     """
-    Stream SSE from llama-server, optionally filtering out reasoning_content chunks.
-    Yields SSE lines (data: {...}\n\n) for content tokens only.
+    Stream SSE from any OpenAI-compatible backend (llama.cpp, Ollama, vLLM, etc.),
+    optionally filtering out reasoning tokens.
+
+    Handles two thinking formats:
+    - reasoning_content deltas (llama.cpp with --reasoning-format deepseek)
+    - <think>...</think> tags in content deltas (Ollama, other backends)
     """
     payload = {**payload, "stream": True}
     payload.pop("tools", None)
+
+    # State for <think> tag stripping in streaming content
+    in_think_block = False
+    think_buffer = ""
 
     async with httpx.AsyncClient() as client:
         async with client.stream(
@@ -628,7 +663,7 @@ async def _stream_from_backend(backend_url: str, payload: dict,
                     yield line + "\n\n"
                     continue
 
-                # Parse the chunk and filter reasoning_content
+                # Parse the chunk and filter reasoning
                 try:
                     chunk = json.loads(line[6:])  # strip "data: "
                     choices = chunk.get("choices", [])
@@ -638,6 +673,7 @@ async def _stream_from_backend(backend_url: str, payload: dict,
 
                     delta = choices[0].get("delta", {})
 
+                    # --- Format 1: reasoning_content field (llama.cpp) ---
                     # Drop pure reasoning_content chunks
                     if "reasoning_content" in delta and "content" not in delta:
                         continue
@@ -650,6 +686,31 @@ async def _stream_from_backend(backend_url: str, payload: dict,
                     if delta.get("content") is None and "role" in delta:
                         yield line + "\n\n"
                         continue
+
+                    # --- Format 2: <think> tags in content (Ollama, etc.) ---
+                    content = delta.get("content", "")
+                    if content and strip_reasoning:
+                        # Check for <think> tag opening
+                        if "<think>" in content:
+                            in_think_block = True
+                            # Keep any content before the tag
+                            before = content.split("<think>")[0]
+                            if before:
+                                delta["content"] = before
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                            continue
+                        # Check for </think> tag closing
+                        if "</think>" in content:
+                            in_think_block = False
+                            # Keep any content after the tag
+                            after = content.split("</think>")[-1]
+                            if after:
+                                delta["content"] = after
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                            continue
+                        # Inside think block — suppress
+                        if in_think_block:
+                            continue
 
                     # Forward content chunks and finish chunks
                     yield f"data: {json.dumps(chunk)}\n\n"
@@ -800,19 +861,15 @@ async def stream_agentic(request_body: dict, backend_url: str,
 
 @app.get("/health")
 async def health():
-    """Health check — verify at least one llama-server and SearXNG are reachable."""
+    """Health check — verify at least one LLM backend and SearXNG are reachable."""
     errors = []
     any_backend_healthy = False
     async with httpx.AsyncClient() as client:
         for url in LLAMA_URLS:
-            try:
-                r = await client.get(f"{url}/health", timeout=5.0)
-                if r.status_code == 200:
-                    any_backend_healthy = True
-                else:
-                    errors.append(f"{url}: HTTP {r.status_code}")
-            except Exception as e:
-                errors.append(f"{url}: {e}")
+            if await _check_backend_health(client, url):
+                any_backend_healthy = True
+            else:
+                errors.append(f"{url}: not reachable")
 
         if not any_backend_healthy:
             errors.insert(0, "No healthy LLM backend available")
@@ -833,7 +890,7 @@ async def health():
 
 async def direct_chat(request_body: dict, skip_thinking: bool = False) -> dict:
     """
-    Forward request directly to llama-server WITHOUT tools (non-streaming).
+    Forward request directly to LLM backend WITHOUT tools (non-streaming).
     Used for non-streaming requests or as fallback.
     """
     backend_url = await get_active_backend()
