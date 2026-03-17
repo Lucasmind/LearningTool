@@ -1,0 +1,54 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# CPU-only build — works on any machine, no GPU required
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    curl \
+    libcurl4-openssl-dev \
+    ca-certificates \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp.git && \
+    cd llama.cpp && \
+    mkdir build && \
+    cd build && \
+    cmake .. \
+        -DLLAMA_BUILD_SERVER=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_NATIVE=OFF \
+        -DLLAMA_F16C=ON \
+        -DLLAMA_FMA=ON \
+        -DLLAMA_AVX=ON \
+        -DLLAMA_AVX2=ON && \
+    cmake --build . --config Release -j$(nproc)
+
+RUN mkdir -p /models /config /cache
+
+COPY entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+WORKDIR /app/llama.cpp
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+CMD ["./build/bin/llama-server", \
+     "--host", "0.0.0.0", \
+     "--port", "8080", \
+     "-m", "/models/model.gguf", \
+     "-c", "16384", \
+     "--parallel", "4", \
+     "--threads", "16"]

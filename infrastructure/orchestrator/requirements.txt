@@ -1,0 +1,6 @@
+fastapi==0.115.*
+uvicorn[standard]==0.34.*
+httpx==0.28.*
+beautifulsoup4==4.13.*
+trafilatura>=2.0,<3.0
+pydantic==2.*

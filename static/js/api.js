@@ -170,5 +170,11 @@ const API = (() => {
         return _fetch('/api/settings/fallback-provider', { method: 'PUT', body: JSON.stringify({ provider_id: id || null }) });
     }
 
-    return { submitQuery, queryStatus, retryQuery, streamQuery, listSessions, createSession, loadSession, saveSession, renameSession, deleteSession, listTrash, restoreSession, permanentDeleteSession, generateTitle, getProviderList, getProviders, addProvider, updateProvider, deleteProvider, testProvider, setDefaultProvider, setFallbackProvider };
+    // ---- Ollama ----
+    function getOllamaModels(baseUrl) {
+        const url = baseUrl || 'http://localhost:11434';
+        return _fetch(`/api/ollama/models?url=${encodeURIComponent(url)}`);
+    }
+
+    return { submitQuery, queryStatus, retryQuery, streamQuery, listSessions, createSession, loadSession, saveSession, renameSession, deleteSession, listTrash, restoreSession, permanentDeleteSession, generateTitle, getProviderList, getProviders, addProvider, updateProvider, deleteProvider, testProvider, setDefaultProvider, setFallbackProvider, getOllamaModels };
 })();

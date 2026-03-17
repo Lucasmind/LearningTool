@@ -51,6 +51,9 @@ class ClaudeCLIProvider:
 
         # Safe: create_subprocess_exec passes args as a list, no shell injection.
         # Prompt is piped via stdin, never interpolated into the command.
+        # --tools: restricted to web search + sub-agents only (no file/shell access)
+        # --permission-mode bypassPermissions: required because -p (non-interactive)
+        #   mode cannot prompt the user for tool permissions
         cmd = [
             "claude", "-p",
             "--output-format", "json",

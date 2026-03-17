@@ -535,6 +535,11 @@ const NodeRenderer = (() => {
                 if (section === 'prompt') {
                     const isCollapsed = !(nodeData.prompt_collapsed !== false);
                     updateNodeCollapsedState(nodeData.id, 'prompt', isCollapsed);
+
+                    // When expanding prompt, clear custom height so node grows to fit
+                    if (!isCollapsed && el.style.height) {
+                        clearCustomHeight(el, nodeData);
+                    }
                 } else if (section === 'response') {
                     const isCollapsed = !(nodeData.response_collapsed !== false);
                     updateNodeCollapsedState(nodeData.id, 'response', isCollapsed);
@@ -609,6 +614,10 @@ const NodeRenderer = (() => {
                 if (window.getSelection().toString().length > 0) return;
                 const isCollapsed = !(nodeData.prompt_collapsed !== false);
                 updateNodeCollapsedState(nodeData.id, 'prompt', isCollapsed);
+                // When expanding prompt, clear custom height so node grows to fit
+                if (!isCollapsed && el.style.height) {
+                    clearCustomHeight(el, nodeData);
+                }
                 rebuildInnerHTML(el, nodeData);
                 Session.scheduleSave();
             });

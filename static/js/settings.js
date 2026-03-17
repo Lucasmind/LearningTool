@@ -113,7 +113,7 @@ const Settings = (() => {
 
         const typeEl = document.createElement('span');
         typeEl.className = 'provider-type-badge';
-        typeEl.textContent = p.type === 'claude-cli' ? 'CLI' : 'API';
+        typeEl.textContent = p.type === 'claude-cli' ? 'CLI' : p.type === 'ollama' ? 'Ollama' : 'API';
         info.appendChild(typeEl);
 
         if (p.id === defaultId) {
@@ -253,10 +253,11 @@ const Settings = (() => {
             { key: 'type', label: 'Type', type: 'select', options: [
                 { value: 'openai-compatible', label: 'OpenAI-Compatible API' },
                 { value: 'claude-cli', label: 'Claude Code (CLI)' },
+                { value: 'ollama', label: 'Ollama (Local)' },
             ], value: existing?.type || 'openai-compatible' },
-            { key: 'url', label: 'API URL', type: 'text', value: existing?.url || '', hideFor: 'claude-cli', placeholder: 'e.g. http://localhost:8080 or http://api.openai.com/v1/chat/completions' },
+            { key: 'url', label: 'API URL', type: 'text', value: existing?.url || '', placeholder: 'e.g. http://localhost:8080 or http://api.openai.com/v1/chat/completions' },
             { key: 'model', label: 'Model', type: 'text', value: existing?.model || '', placeholder: 'e.g. opus, sonnet, haiku (for CLI) or gpt-4o (for API)' },
-            { key: 'api_key', label: 'API Key', type: 'password', value: existing?.api_key || '', hideFor: 'claude-cli' },
+            { key: 'api_key', label: 'API Key', type: 'password', value: existing?.api_key || '' },
             { key: 'max_tokens', label: 'Max Tokens', type: 'number', value: existing?.max_tokens ?? 4096 },
             { key: 'temperature', label: 'Temperature', type: 'number', value: existing?.temperature ?? 0.7, step: '0.1' },
             { key: 'timeout', label: 'Timeout (seconds)', type: 'number', value: existing?.timeout ?? 300 },
@@ -306,13 +307,103 @@ const Settings = (() => {
             fieldRows[f.key] = row;
         }
 
+        // Ollama model dropdown row
+        const ollamaModelRow = document.createElement('div');
+        ollamaModelRow.className = 'form-row';
+        const ollamaModelLabel = document.createElement('label');
+        ollamaModelLabel.textContent = 'Model';
+        ollamaModelRow.appendChild(ollamaModelLabel);
+
+        const ollamaModelWrap = document.createElement('div');
+        ollamaModelWrap.style.display = 'flex';
+        ollamaModelWrap.style.gap = '8px';
+        ollamaModelWrap.style.flex = '1';
+
+        const ollamaModelSelect = document.createElement('select');
+        ollamaModelSelect.className = 'form-input';
+        ollamaModelSelect.style.flex = '1';
+        ollamaModelWrap.appendChild(ollamaModelSelect);
+
+        const refreshBtn = document.createElement('button');
+        refreshBtn.className = 'btn btn-sm';
+        refreshBtn.textContent = 'Refresh';
+        refreshBtn.type = 'button';
+        ollamaModelWrap.appendChild(refreshBtn);
+
+        ollamaModelRow.appendChild(ollamaModelWrap);
+
+        // Insert after the model text input row
+        const modelRowIndex = Array.from(form.children).indexOf(fieldRows.model);
+        if (modelRowIndex >= 0 && modelRowIndex < form.children.length - 1) {
+            form.insertBefore(ollamaModelRow, fieldRows.model.nextSibling);
+        } else {
+            form.appendChild(ollamaModelRow);
+        }
+
+        async function fetchOllamaModels() {
+            const baseUrl = inputs.url.value || 'http://localhost:11434';
+            ollamaModelSelect.disabled = true;
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '...';
+            while (ollamaModelSelect.firstChild) ollamaModelSelect.removeChild(ollamaModelSelect.firstChild);
+            const loadingOpt = document.createElement('option');
+            loadingOpt.textContent = 'Loading...';
+            ollamaModelSelect.appendChild(loadingOpt);
+
+            try {
+                const data = await API.getOllamaModels(baseUrl);
+                while (ollamaModelSelect.firstChild) ollamaModelSelect.removeChild(ollamaModelSelect.firstChild);
+
+                if (data.error) {
+                    const errOpt = document.createElement('option');
+                    errOpt.textContent = 'Cannot reach Ollama — is it running?';
+                    ollamaModelSelect.appendChild(errOpt);
+                } else if (data.models.length === 0) {
+                    const emptyOpt = document.createElement('option');
+                    emptyOpt.textContent = 'No models installed';
+                    ollamaModelSelect.appendChild(emptyOpt);
+                } else {
+                    for (const m of data.models) {
+                        const opt = document.createElement('option');
+                        opt.value = m.name;
+                        const sizeMB = m.size ? ` (${(m.size / 1e9).toFixed(1)}GB)` : '';
+                        opt.textContent = m.name + sizeMB;
+                        if (existing && existing.model === m.name) opt.selected = true;
+                        ollamaModelSelect.appendChild(opt);
+                    }
+                }
+            } catch (e) {
+                while (ollamaModelSelect.firstChild) ollamaModelSelect.removeChild(ollamaModelSelect.firstChild);
+                const errOpt = document.createElement('option');
+                errOpt.textContent = 'Error: ' + e.message;
+                ollamaModelSelect.appendChild(errOpt);
+            }
+            ollamaModelSelect.disabled = false;
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = 'Refresh';
+        }
+
+        refreshBtn.addEventListener('click', fetchOllamaModels);
+
         // Toggle visibility based on type
         function updateVisibility() {
             const type = inputs.type.value;
-            for (const f of fields) {
-                if (f.hideFor && fieldRows[f.key]) {
-                    fieldRows[f.key].style.display = type === f.hideFor ? 'none' : '';
-                }
+            // URL: show for openai-compatible and ollama, hide for claude-cli
+            fieldRows.url.style.display = type === 'claude-cli' ? 'none' : '';
+            // API Key: show only for openai-compatible
+            fieldRows.api_key.style.display = type === 'openai-compatible' ? '' : 'none';
+            // Model text input: hide for ollama (replaced by dropdown)
+            fieldRows.model.style.display = type === 'ollama' ? 'none' : '';
+            // Ollama model dropdown: show only for ollama
+            ollamaModelRow.style.display = type === 'ollama' ? '' : 'none';
+
+            // Auto-fill URL for ollama
+            if (type === 'ollama' && !inputs.url.value) {
+                inputs.url.value = 'http://localhost:11434';
+            }
+            // Fetch models when switching to ollama
+            if (type === 'ollama') {
+                fetchOllamaModels();
             }
         }
         inputs.type.addEventListener('change', updateVisibility);
@@ -336,6 +427,10 @@ const Settings = (() => {
                 } else {
                     data[f.key] = inputs[f.key].value;
                 }
+            }
+            // For ollama, use the dropdown value instead of text input
+            if (data.type === 'ollama' && ollamaModelSelect.value) {
+                data.model = ollamaModelSelect.value;
             }
             // Don't send empty password (means "keep existing")
             if (existing && !data.api_key) {

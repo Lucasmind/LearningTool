@@ -5,3 +5,7 @@ __pycache__/
 learning_sessions/
 learning_sessions_trash/
 settings/
+models/
+docker-compose.yml
+*.yml.bak
+infrastructure/**/__pycache__/

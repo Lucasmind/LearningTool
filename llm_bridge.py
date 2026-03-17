@@ -14,7 +14,7 @@ from claude_cli_provider import ClaudeCLIProvider
 
 
 # Default LLM endpoint (chimera AI server)
-DEFAULT_LLM_URL = "http://192.168.1.221:8080/v1/chat/completions"
+DEFAULT_LLM_URL = "http://localhost:11434/v1/chat/completions"
 DEFAULT_LLM_MODEL = ""
 
 
@@ -303,6 +303,17 @@ class ProviderRegistry:
             return ClaudeCLIProvider(
                 model=config.get("model", "opus"),
                 timeout=config.get("timeout", 120),
+                provider_id=config["id"],
+            )
+        elif ptype == "ollama":
+            url = config.get("url", "http://localhost:11434")
+            return OpenAICompatibleProvider(
+                url=url,
+                model=config.get("model", ""),
+                api_key="",
+                max_tokens=config.get("max_tokens", 4096),
+                temperature=config.get("temperature", 0.7),
+                timeout=config.get("timeout", 300),
                 provider_id=config["id"],
             )
         else:

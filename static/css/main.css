@@ -505,6 +505,10 @@ html, body {
 .node-response.collapsed {
     max-height: 320px;
 }
+/* When prompt is expanded, ensure response stays visible with scroll */
+.node-prompt:not(.collapsed) ~ .node-response.collapsed {
+    min-height: 120px;
+}
 /* When node has a custom height, let response fill available space instead of fixed max-height */
 .has-custom-height .node-response.collapsed {
     max-height: none;

@@ -7,6 +7,7 @@ Serves API + static files on port 8100.
 import argparse
 import asyncio
 import json
+import os
 import uuid
 import time
 from pathlib import Path
@@ -36,8 +37,9 @@ SETTINGS_DIR = BASE_DIR / "settings"
 # ---- Parse CLI args (before FastAPI setup) ----
 _parser = argparse.ArgumentParser(description="Learning Tool server")
 _parser.add_argument("--port", type=int, default=8100, help="Server port (default: 8100)")
-_parser.add_argument("--llm-url", default="http://192.168.1.221:8080/v1/chat/completions",
-                      help="LLM API endpoint (default: chimera server)")
+_parser.add_argument("--llm-url",
+                      default=os.environ.get("LLM_URL", "http://localhost:11434/v1/chat/completions"),
+                      help="LLM API endpoint (or set LLM_URL env var)")
 _parser.add_argument("--llm-model", default="",
                       help="Model name (optional, server uses loaded model)")
 _cli_args, _ = _parser.parse_known_args()
@@ -364,6 +366,30 @@ async def set_fallback_provider(req: DefaultProviderSet):
     if not settings_mgr.set_fallback(req.provider_id):
         raise HTTPException(400, "Provider not found")
     return {"status": "ok", "fallback_provider_id": req.provider_id}
+
+
+# ---- API: Ollama ----
+
+@app.get("/api/ollama/models")
+async def list_ollama_models(url: str = "http://localhost:11434"):
+    """List models available on an Ollama instance."""
+    import urllib.request
+    import urllib.error
+    tags_url = url.rstrip("/") + "/api/tags"
+    try:
+        req = urllib.request.Request(tags_url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = []
+            for m in data.get("models", []):
+                models.append({
+                    "name": m["name"],
+                    "size": m.get("size", 0),
+                    "modified_at": m.get("modified_at", ""),
+                })
+            return {"models": models}
+    except Exception as e:
+        return {"models": [], "error": str(e)}
 
 
 # ---- API: Session endpoints ----

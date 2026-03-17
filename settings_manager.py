@@ -36,7 +36,7 @@ class SettingsManager:
                     "id": provider_id,
                     "alias": "Local LLM",
                     "type": "openai-compatible",
-                    "url": cli_url or "http://192.168.1.221:8080/v1/chat/completions",
+                    "url": cli_url or "http://localhost:11434/v1/chat/completions",
                     "model": cli_model or "",
                     "api_key": "",
                     "enabled": True,
