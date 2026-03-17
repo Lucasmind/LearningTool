@@ -37,6 +37,8 @@ SETTINGS_DIR = BASE_DIR / "settings"
 # ---- Parse CLI args (before FastAPI setup) ----
 _parser = argparse.ArgumentParser(description="Learning Tool server")
 _parser.add_argument("--port", type=int, default=8100, help="Server port (default: 8100)")
+_parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"),
+                      help="Bind address (default: 127.0.0.1, set to 0.0.0.0 for Docker)")
 _parser.add_argument("--llm-url",
                       default=os.environ.get("LLM_URL", "http://localhost:11434/v1/chat/completions"),
                       help="LLM API endpoint (or set LLM_URL env var)")
@@ -469,4 +471,4 @@ if __name__ == "__main__":
     default_prov = settings_mgr.get_provider(settings_mgr.get_default_id())
     if default_prov:
         print(f"Default provider: {default_prov['alias']} ({default_prov['type']})")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    uvicorn.run(app, host=_cli_args.host, port=port, log_level="info")

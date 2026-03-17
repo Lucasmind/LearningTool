@@ -299,14 +299,24 @@ def generate_compose(model, gpu, models_dir, enable_search=True):
     model_files = model["files"]
     primary_file = model_files[0]
 
-    # Determine llama-server Dockerfile
-    if gpu["vendor"] in ("nvidia", "amd", "intel"):
-        llama_dockerfile = "Dockerfile"  # Vulkan — works with AMD, Intel, and NVIDIA
+    # Determine llama-server Dockerfile based on GPU
+    if gpu["vendor"] == "nvidia":
+        llama_dockerfile = "Dockerfile.cuda"  # NVIDIA — use CUDA for best performance
+    elif gpu["vendor"] in ("amd", "intel"):
+        llama_dockerfile = "Dockerfile"  # AMD/Intel — use Vulkan
     else:
         llama_dockerfile = "Dockerfile.cpu"
 
     # Build llama-server command
-    ctx = model.get("context_window", 16384)
+    # Cap context window based on available RAM to avoid OOM
+    # Large context eats memory — small models shouldn't use 128K+
+    native_ctx = model.get("context_window", 16384)
+    if model["ram_gb"] <= 4:
+        ctx = min(native_ctx, 8192)
+    elif model["ram_gb"] <= 12:
+        ctx = min(native_ctx, 32768)
+    else:
+        ctx = min(native_ctx, 65536)
     threads = model.get("recommended_threads", 4)
     batch = model.get("recommended_batch_size", 512)
     parallel = 2 if model["ram_gb"] > 10 else 1
@@ -346,26 +356,40 @@ def generate_compose(model, gpu, models_dir, enable_search=True):
     mem_limit = f"{int(model['ram_gb'] + 4)}G"
     mem_reserve = f"{int(model['ram_gb'])}G"
 
-    # Vulkan device mounts
-    vulkan_devices = ""
-    vulkan_env = ""
+    # GPU device mounts (non-deploy config like devices, group_add)
+    gpu_devices = ""
+    gpu_env = ""
     if gpu["vendor"] in ("amd", "intel"):
-        vulkan_devices = """    devices:
+        gpu_devices = """    devices:
       - /dev/dri:/dev/dri
     group_add:
       - video"""
-        vulkan_env = """      - VULKAN_DEVICE=0
+        gpu_env = """      - VULKAN_DEVICE=0
       - GGML_VULKAN_DEVICE=0"""
-    elif gpu["vendor"] == "nvidia":
-        vulkan_devices = """    devices:
-      - /dev/dri:/dev/dri
-    group_add:
-      - video"""
 
     # Build compose
     services = {}
 
-    # LLM Server
+    # LLM Server — deploy block differs for NVIDIA (needs GPU reservation)
+    if gpu["vendor"] == "nvidia":
+        deploy_block = f"""    deploy:
+      resources:
+        limits:
+          memory: {mem_limit}
+        reservations:
+          memory: {mem_reserve}
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]"""
+    else:
+        deploy_block = f"""    deploy:
+      resources:
+        limits:
+          memory: {mem_limit}
+        reservations:
+          memory: {mem_reserve}"""
+
     llama_service = f"""  llm-server:
     build:
       context: ./infrastructure/llama-server
@@ -381,14 +405,9 @@ def generate_compose(model, gpu, models_dir, enable_search=True):
       - N_GPU_LAYERS={gpu_layers}
       - PARALLEL_REQUESTS={parallel}
       - THREADS={threads}
-{vulkan_env}
-{vulkan_devices}
-    deploy:
-      resources:
-        limits:
-          memory: {mem_limit}
-        reservations:
-          memory: {mem_reserve}
+{gpu_env}
+{gpu_devices}
+{deploy_block}
     shm_size: 4gb
     command: >
       {llama_command}
@@ -407,17 +426,14 @@ def generate_compose(model, gpu, models_dir, enable_search=True):
     else:
         orchestrator_env += "\n      - SEARXNG_URL="
 
-    orchestrator_deps = "      - llm-server"
     if enable_search:
-        orchestrator_deps += """
-    depends_on:
+        orchestrator_deps = """    depends_on:
       llm-server:
         condition: service_healthy
       searxng:
         condition: service_healthy"""
     else:
-        orchestrator_deps += """
-    depends_on:
+        orchestrator_deps = """    depends_on:
       llm-server:
         condition: service_healthy"""
 

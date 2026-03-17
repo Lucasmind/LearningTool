@@ -1,0 +1,72 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    libcurl4-openssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Make CUDA stub available for linking (real driver provided at runtime)
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/cuda-stubs.conf && \
+    ldconfig
+
+# Clone llama.cpp latest master and build with CUDA
+RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp.git && \
+    cd llama.cpp && \
+    mkdir build && \
+    cd build && \
+    cmake .. \
+        -DGGML_CUDA=ON \
+        -DLLAMA_BUILD_SERVER=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_NATIVE=OFF && \
+    cmake --build . --config Release -j$(nproc)
+
+# Runtime stage — smaller image with just CUDA runtime
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    libcurl4 \
+    libgomp1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/llama.cpp
+
+# Copy built binaries and libraries from builder
+COPY --from=builder /app/llama.cpp/build/bin/ ./build/bin/
+COPY --from=builder /app/llama.cpp/build/src/ ./build/src/
+COPY --from=builder /app/llama.cpp/build/ggml/ ./build/ggml/
+
+RUN mkdir -p /models /config /cache
+
+COPY entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+CMD ["./build/bin/llama-server", \
+     "--host", "0.0.0.0", \
+     "--port", "8080", \
+     "-m", "/models/model.gguf", \
+     "-c", "16384", \
+     "--n-gpu-layers", "-1", \
+     "--parallel", "4", \
+     "--threads", "16"]
