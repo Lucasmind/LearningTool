@@ -1,17 +1,10 @@
 """
-LearningTool Orchestrator — Agentic LLM Proxy
+LLM Orchestrator with Web Search
 
-An agentic proxy that sits between clients and any llama.cpp (or OpenAI-compatible)
-backend, providing:
-  - Web search via SearXNG (optional — works without it, just routes directly)
-  - Tool-calling loop: browser.search, browser.open, browser.find
-  - Thinking mode control: auto-disables extended thinking for utility/image requests
-  - Smart routing: classifies user intent to decide search vs direct response
-  - Response cleanup: strips reasoning_content, handles empty responses gracefully
+Agentic proxy that sits between clients and llama-server, executing
+browser tool calls (search/open/find) against SearXNG and web pages.
 
-Exposes an OpenAI-compatible /v1/chat/completions endpoint (default port 8081).
-Configure backends via LLAMA_URL / LLAMA_URLS environment variables.
-Configure SearXNG via SEARXNG_URL (if omitted, web search is disabled).
+Exposes an OpenAI-compatible /v1/chat/completions endpoint on port 8081.
 """
 
 import os
@@ -30,14 +23,16 @@ from bs4 import BeautifulSoup
 # Configuration
 # ---------------------------------------------------------------------------
 
-LLAMA_URL = os.getenv("LLAMA_URL", "http://llama-server:8080")
+LLAMA_URL = os.getenv("LLAMA_URL", "http://oss-120b-vulkan:8080")
 LLAMA_URLS = [u.strip() for u in os.getenv("LLAMA_URLS", LLAMA_URL).split(",")]
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080")
-SEARXNG_AVAILABLE: bool | None = None  # None = not yet checked
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
 SEARCH_RESULTS_COUNT = int(os.getenv("SEARCH_RESULTS_COUNT", "5"))
 PAGE_CACHE_SIZE = int(os.getenv("PAGE_CACHE_SIZE", "20"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
+
+# Model type detection: maps base URL -> "harmony" or "standard"
+_backend_type_cache: dict[str, str] = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orchestrator")
@@ -46,47 +41,52 @@ app = FastAPI(title="LLM Orchestrator with Web Search")
 
 
 # ---------------------------------------------------------------------------
-# Backend discovery — find a healthy llama-server
+# Backend discovery — find a healthy llama-server and detect model type
 # ---------------------------------------------------------------------------
 
 
-async def get_active_backend() -> str:
-    """Return the base_url for the first healthy backend."""
+async def get_active_backend() -> tuple[str, str]:
+    """
+    Return (base_url, model_type) for the first healthy backend.
+    model_type is 'harmony' for gpt-oss-120b or 'standard' for others (Nemotron, etc).
+    """
     async with httpx.AsyncClient() as client:
         for url in LLAMA_URLS:
             try:
                 r = await client.get(f"{url}/health", timeout=5.0)
                 if r.status_code == 200:
-                    log.info("Using backend %s", url)
-                    return url
+                    model_type = await _detect_model_type(client, url)
+                    log.info("Using backend %s (model type: %s)", url, model_type)
+                    return url, model_type
             except Exception:
                 log.debug("Backend %s not reachable", url)
                 continue
 
     # Fall back to first URL even if unhealthy
     log.warning("No healthy backend found, falling back to %s", LLAMA_URLS[0])
-    return LLAMA_URLS[0]
-
-# ---------------------------------------------------------------------------
-# SearXNG availability check
-# ---------------------------------------------------------------------------
+    return LLAMA_URLS[0], "standard"
 
 
-async def check_searxng_available() -> bool:
-    """Check if SearXNG is reachable. Caches the result after first check."""
-    global SEARXNG_AVAILABLE
-    if SEARXNG_AVAILABLE is not None:
-        return SEARXNG_AVAILABLE
+async def _detect_model_type(client: httpx.AsyncClient, base_url: str) -> str:
+    """Detect whether the backend is running a harmony-format model or standard."""
+    if base_url in _backend_type_cache:
+        return _backend_type_cache[base_url]
+
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(f"{SEARXNG_URL}/healthz", timeout=5.0)
-            SEARXNG_AVAILABLE = r.status_code == 200
+        r = await client.get(f"{base_url}/v1/models", timeout=10.0)
+        if r.status_code == 200:
+            data = r.json()
+            models = data.get("data", [])
+            for m in models:
+                model_id = m.get("id", "").lower()
+                if "oss" in model_id or "gpt-oss" in model_id:
+                    _backend_type_cache[base_url] = "harmony"
+                    return "harmony"
     except Exception:
-        SEARXNG_AVAILABLE = False
-    if not SEARXNG_AVAILABLE:
-        log.warning("SearXNG not available at %s — web search disabled", SEARXNG_URL)
-    return SEARXNG_AVAILABLE
+        pass
 
+    _backend_type_cache[base_url] = "standard"
+    return "standard"
 
 # ---------------------------------------------------------------------------
 # Page cache (LRU) for browser.open / browser.find
@@ -126,7 +126,7 @@ BROWSER_TOOLS = [
         "type": "function",
         "function": {
             "name": "browser.open",
-            "description": "Open a URL and read its content. Returns extracted text from the page.",
+            "description": "Open a URL and read its content. Only open 1-2 pages max — prefer using search snippets when possible.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -279,15 +279,46 @@ async def execute_find(pattern: str, cursor: int = 0) -> str:
 
 TOOL_DISPATCH = {
     "browser.search": lambda args: execute_search(
-        args["query"], args.get("topn", SEARCH_RESULTS_COUNT)
+        args.get("query", ""), args.get("topn", SEARCH_RESULTS_COUNT)
     ),
     "browser.open": lambda args: execute_open(
-        args["id"], args.get("num_lines", 80), args.get("cursor", 0)
+        args.get("id") or args.get("url", ""), min(args.get("num_lines", 60), 60), args.get("cursor", 0)
     ),
     "browser.find": lambda args: execute_find(
-        args["pattern"], args.get("cursor", 0)
+        args.get("pattern", ""), args.get("cursor", 0)
     ),
 }
+
+# ---------------------------------------------------------------------------
+# Harmony token cleanup (from scripts/llm-proxy.py)
+# ---------------------------------------------------------------------------
+
+
+def extract_final_content(text: str) -> str:
+    """Extract final channel content and strip harmony tokens."""
+    if not text:
+        return text
+
+    # Try to extract final channel
+    final_match = re.search(
+        r"<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|$)", text, re.DOTALL
+    )
+    if final_match:
+        return final_match.group(1).strip()
+
+    # Remove analysis/commentary channels
+    cleaned = re.sub(
+        r"<\|channel\|>(?:analysis|commentary)<\|message\|>.*?<\|end\|>",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    # Remove any remaining harmony tags
+    cleaned = re.sub(r"<\|[^|]+\|>", "", cleaned)
+    cleaned = cleaned.strip()
+
+    return cleaned if cleaned else text
+
 
 # ---------------------------------------------------------------------------
 # Search intent classification (Option C: keyword heuristic + ambiguous)
@@ -431,10 +462,10 @@ def classify_search_intent(messages: list) -> str:
 SEARCH_SYSTEM_PROMPT = (
     "You have access to browser tools for searching the web. "
     "When you search, you will get results with titles, URLs, and snippet text. "
+    "IMPORTANT: Prefer using search snippets to compose your answer. "
+    "Only use browser.open on 1-2 pages maximum if the snippets are truly insufficient. "
     "Many websites block automated page access (returning HTTP 403 errors). "
-    "If browser.open fails with a 403 or other error, DO NOT keep retrying different pages. "
-    "Instead, use the information from the search snippets to compose your answer. "
-    "Search snippets often contain enough information to answer the user's question. "
+    "If browser.open fails, DO NOT retry other pages — use the search snippets instead. "
     "When providing your final answer, write a helpful, complete response for the user "
     "including relevant URLs as references."
 )
@@ -446,8 +477,8 @@ async def agentic_chat(request_body: dict) -> dict:
     Execute tool calls in a loop until the model returns a final response.
     Automatically detects which backend is available and adapts cleanup logic.
     """
-    backend_url = await get_active_backend()
-    log.info("Agentic chat using backend %s", backend_url)
+    backend_url, model_type = await get_active_backend()
+    log.info("Agentic chat using backend %s (%s)", backend_url, model_type)
 
     messages = list(request_body.get("messages", []))
     original_max_tokens = request_body.get("max_tokens")
@@ -481,7 +512,16 @@ async def agentic_chat(request_body: dict) -> dict:
                 json=payload,
                 timeout=REQUEST_TIMEOUT,
             )
-            resp.raise_for_status()
+
+        if resp.status_code != 200:
+            error_body = resp.text[:500]
+            log.error("Backend returned %d on tool round %d: %s",
+                      resp.status_code, round_num + 1, error_body)
+            log.error("Payload keys: %s, message roles: %s",
+                      list(payload.keys()),
+                      [m.get("role") for m in messages])
+            # Fall back to direct answer without tools
+            return await _get_final_answer(request_body, messages, backend_url)
 
         result = resp.json()
 
@@ -494,7 +534,7 @@ async def agentic_chat(request_body: dict) -> dict:
         tool_calls = assistant_msg.get("tool_calls")
 
         if not tool_calls:
-            return await _cleanup_response(result, messages, request_body, backend_url)
+            return await _cleanup_response(result, model_type, messages, request_body, backend_url)
 
         # Model wants to call tools
         log.info(
@@ -517,14 +557,18 @@ async def agentic_chat(request_body: dict) -> dict:
             handler = TOOL_DISPATCH.get(fn_name)
             if handler:
                 log.info("Executing %s(%s)", fn_name, json.dumps(args, ensure_ascii=False)[:200])
-                tool_result = await handler(args)
+                try:
+                    tool_result = await handler(args)
+                except Exception as e:
+                    log.error("Tool %s failed: %s", fn_name, e)
+                    tool_result = f"Error executing {fn_name}: {e}"
             else:
                 tool_result = f"Unknown tool: {fn_name}"
                 log.warning("Unknown tool call: %s", fn_name)
 
             # Truncate very long results to avoid blowing context
-            if len(tool_result) > 12000:
-                tool_result = tool_result[:12000] + "\n\n[... truncated]"
+            if len(tool_result) > 4000:
+                tool_result = tool_result[:4000] + "\n\n[... truncated]"
 
             messages.append({
                 "role": "tool",
@@ -546,21 +590,41 @@ async def agentic_chat(request_body: dict) -> dict:
     return await _get_final_answer(request_body, messages, backend_url)
 
 
-async def _cleanup_response(result: dict, messages: list,
+async def _cleanup_response(result: dict, model_type: str, messages: list,
                             request_body: dict, backend_url: str) -> dict:
     """
-    Clean up a final model response. Handles empty content (e.g., when the model
-    only produced reasoning_content) and strips reasoning_content from the output.
+    Clean up a final model response. For harmony models (gpt-oss-120b),
+    strip harmony tokens and handle reasoning_content. For standard models
+    (Nemotron, etc.), just pass through with minimal cleanup.
     """
     choice = result["choices"][0]
     assistant_msg = choice["message"]
     content = assistant_msg.get("content") or ""
     reasoning = assistant_msg.get("reasoning_content") or ""
 
-    # If content is empty but reasoning is present, use reasoning as content
-    if not content and reasoning:
-        log.info("Content empty but reasoning_content present, using reasoning")
-        assistant_msg["content"] = reasoning
+    if model_type == "harmony":
+        # Harmony-format model: extract final channel, strip tags
+        if content:
+            cleaned = extract_final_content(content)
+            assistant_msg["content"] = cleaned if cleaned else content
+        elif reasoning and not content:
+            log.info("Content empty but reasoning_content present, using reasoning")
+            assistant_msg["content"] = extract_final_content(reasoning) or reasoning
+
+        # Check if content is still empty or just reasoning echoed
+        content = assistant_msg.get("content") or ""
+        if not content or content == reasoning:
+            log.info("Model response looks like reasoning, requesting explicit final answer")
+            messages.append(assistant_msg)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Please write your final response to my original question "
+                    "using all the information you gathered from your searches. "
+                    "Include relevant URLs as references."
+                ),
+            })
+            return await _get_final_answer(request_body, messages, backend_url)
 
     # Strip reasoning_content to prevent it showing in Open WebUI
     if "reasoning_content" in assistant_msg:
@@ -589,11 +653,20 @@ async def _get_final_answer(request_body: dict, messages: list,
         content = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or ""
 
-        # If content is empty, use reasoning as fallback
-        if not content and reasoning:
-            msg["content"] = reasoning
+        # Clean harmony tokens from content
+        if content:
+            cleaned = extract_final_content(content)
+            msg["content"] = cleaned if cleaned else content
 
-        # Strip reasoning_content from the response
+        # If content is empty or identical to reasoning (model stayed in analysis mode),
+        # the model didn't produce a proper final answer — use reasoning as fallback
+        content = msg.get("content") or ""
+        if not content or content == reasoning:
+            if reasoning:
+                msg["content"] = extract_final_content(reasoning) or reasoning
+
+        # Strip the reasoning_content from the response to prevent Open WebUI
+        # from displaying it as the primary response
         if "reasoning_content" in msg:
             del msg["reasoning_content"]
 
@@ -605,34 +678,84 @@ async def _get_final_answer(request_body: dict, messages: list,
 # ---------------------------------------------------------------------------
 
 
-async def stream_final_response(request_body: dict, messages: list):
+async def _stream_from_backend(backend_url: str, payload: dict,
+                                strip_reasoning: bool = True):
     """
-    After tool rounds complete, stream the final model response.
-    Yields Server-Sent Events.
+    Stream SSE from llama-server, optionally filtering out reasoning_content chunks.
+    Yields SSE lines (data: {...}\n\n) for content tokens only.
     """
-    payload = {
-        **request_body,
-        "messages": messages,
-        "stream": True,
-    }
-    # Don't include tools on the final streaming round
+    payload = {**payload, "stream": True}
     payload.pop("tools", None)
 
     async with httpx.AsyncClient() as client:
         async with client.stream(
             "POST",
-            f"{LLAMA_URL}/v1/chat/completions",
+            f"{backend_url}/v1/chat/completions",
             json=payload,
             timeout=REQUEST_TIMEOUT,
         ) as resp:
             async for line in resp.aiter_lines():
-                if line:
-                    yield line + "\n"
+                if not line or not line.startswith("data: "):
+                    continue
+
+                # Pass through [DONE]
+                if line.strip() == "data: [DONE]":
+                    yield line + "\n\n"
+                    continue
+
+                if not strip_reasoning:
+                    yield line + "\n\n"
+                    continue
+
+                # Parse the chunk and filter reasoning_content
+                try:
+                    chunk = json.loads(line[6:])  # strip "data: "
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        yield line + "\n\n"
+                        continue
+
+                    delta = choices[0].get("delta", {})
+
+                    # Drop pure reasoning_content chunks
+                    if "reasoning_content" in delta and "content" not in delta:
+                        continue
+
+                    # Strip reasoning_content from mixed chunks
+                    if "reasoning_content" in delta:
+                        del delta["reasoning_content"]
+
+                    # Skip initial chunk where content is null (role announcement)
+                    if delta.get("content") is None and "role" in delta:
+                        yield line + "\n\n"
+                        continue
+
+                    # Forward content chunks and finish chunks
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    # Can't parse — forward as-is
+                    yield line + "\n\n"
 
 
-async def agentic_chat_streaming(request_body: dict):
+async def stream_direct(request_body: dict, backend_url: str,
+                         skip_thinking: bool = False,
+                         strip_reasoning: bool = True):
+    """Stream a direct (non-search) request."""
+    payload = {**request_body}
+    if skip_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        strip_reasoning = False  # nothing to strip
+
+    async for chunk in _stream_from_backend(backend_url, payload,
+                                             strip_reasoning=strip_reasoning):
+        yield chunk
+
+
+async def stream_agentic(request_body: dict, backend_url: str, model_type: str,
+                          strip_reasoning: bool = True):
     """
-    Run tool rounds non-streaming, then stream the final response.
+    Run tool rounds non-streaming, then stream the final answer.
     """
     messages = list(request_body.get("messages", []))
     original_max_tokens = request_body.get("max_tokens")
@@ -656,19 +779,32 @@ async def agentic_chat_streaming(request_body: dict):
         if original_max_tokens:
             payload["max_tokens"] = max(original_max_tokens, 2048)
 
-        log.info("Tool round %d (streaming mode): sending %d messages", round_num + 1, len(messages))
+        log.info("Tool round %d (streaming): sending %d messages to %s",
+                 round_num + 1, len(messages), backend_url)
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{LLAMA_URL}/v1/chat/completions",
+                f"{backend_url}/v1/chat/completions",
                 json=payload,
                 timeout=REQUEST_TIMEOUT,
             )
-            resp.raise_for_status()
+
+        if resp.status_code != 200:
+            error_body = resp.text[:500]
+            log.error("Backend returned %d on tool round %d: %s",
+                      resp.status_code, round_num + 1, error_body)
+            log.error("Payload keys: %s, message roles: %s",
+                      list(payload.keys()),
+                      [m.get("role") for m in messages])
+            # Fall back to streaming without tools instead of crashing
+            final_payload = {**request_body, "messages": messages}
+            async for chunk in _stream_from_backend(backend_url, final_payload,
+                                                     strip_reasoning=strip_reasoning):
+                yield chunk
+            return
 
         result = resp.json()
         if not result.get("choices"):
-            # Return as non-streaming response
             yield f"data: {json.dumps(result)}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -678,18 +814,18 @@ async def agentic_chat_streaming(request_body: dict):
         tool_calls = assistant_msg.get("tool_calls")
 
         if not tool_calls:
-            # No tools needed — stream this response directly
-            # Re-request with streaming enabled
-            async for line in stream_final_response(request_body, messages):
-                yield line
+            # No more tools — stream the final answer
+            # Re-request with streaming, no tools
+            final_payload = {**request_body, "messages": messages}
+            async for chunk in _stream_from_backend(backend_url, final_payload,
+                                                     strip_reasoning=strip_reasoning):
+                yield chunk
             return
 
-        # Execute tools (same as non-streaming path)
-        log.info(
-            "Model requested %d tool call(s): %s",
-            len(tool_calls),
-            [tc["function"]["name"] for tc in tool_calls],
-        )
+        # Execute tools
+        log.info("Model requested %d tool call(s): %s",
+                 len(tool_calls),
+                 [tc["function"]["name"] for tc in tool_calls])
         messages.append(assistant_msg)
 
         for tc in tool_calls:
@@ -701,13 +837,18 @@ async def agentic_chat_streaming(request_body: dict):
 
             handler = TOOL_DISPATCH.get(fn_name)
             if handler:
-                log.info("Executing %s(%s)", fn_name, json.dumps(args, ensure_ascii=False)[:200])
-                tool_result = await handler(args)
+                log.info("Executing %s(%s)", fn_name,
+                         json.dumps(args, ensure_ascii=False)[:200])
+                try:
+                    tool_result = await handler(args)
+                except Exception as e:
+                    log.error("Tool %s failed: %s", fn_name, e)
+                    tool_result = f"Error executing {fn_name}: {e}"
             else:
                 tool_result = f"Unknown tool: {fn_name}"
 
-            if len(tool_result) > 12000:
-                tool_result = tool_result[:12000] + "\n\n[... truncated]"
+            if len(tool_result) > 4000:
+                tool_result = tool_result[:4000] + "\n\n[... truncated]"
 
             messages.append({
                 "role": "tool",
@@ -715,10 +856,20 @@ async def agentic_chat_streaming(request_body: dict):
                 "content": tool_result,
             })
 
-    # Exhausted rounds — stream final answer without tools
+    # Exhausted tool rounds — stream final answer without tools
     log.warning("Exhausted %d tool rounds, streaming final answer", MAX_TOOL_ROUNDS)
-    async for line in stream_final_response(request_body, messages):
-        yield line
+    messages.append({
+        "role": "user",
+        "content": (
+            "You have finished searching. Now please write your final, comprehensive "
+            "response to my original question using all the information you gathered. "
+            "Include relevant URLs as references. Do not attempt any more tool calls."
+        ),
+    })
+    final_payload = {**request_body, "messages": messages}
+    async for chunk in _stream_from_backend(backend_url, final_payload,
+                                             strip_reasoning=True):
+        yield chunk
 
 
 # ---------------------------------------------------------------------------
@@ -728,9 +879,8 @@ async def agentic_chat_streaming(request_body: dict):
 
 @app.get("/health")
 async def health():
-    """Health check — verify at least one llama-server is reachable. SearXNG is optional."""
+    """Health check — verify at least one llama-server and SearXNG are reachable."""
     errors = []
-    warnings = []
     any_backend_healthy = False
     async with httpx.AsyncClient() as client:
         for url in LLAMA_URLS:
@@ -749,31 +899,23 @@ async def health():
         try:
             r = await client.get(f"{SEARXNG_URL}/healthz", timeout=5.0)
             if r.status_code != 200:
-                warnings.append(f"searxng: HTTP {r.status_code} (web search disabled)")
+                errors.append(f"searxng: HTTP {r.status_code}")
         except Exception as e:
-            warnings.append(f"searxng: {e} (web search disabled)")
+            errors.append(f"searxng: {e}")
 
     if not any_backend_healthy:
         return JSONResponse({"status": "unhealthy", "errors": errors}, status_code=503)
-    result = {"status": "ok"}
-    if warnings:
-        result["status"] = "degraded"
-        result["warnings"] = warnings
-        result["note"] = "LLM backends healthy, web search unavailable"
     if errors:
-        result["status"] = "degraded"
-        result["errors"] = errors
-        result["note"] = "At least one backend is healthy"
-    return JSONResponse(result)
+        return JSONResponse({"status": "degraded", "errors": errors, "note": "At least one backend is healthy"})
+    return {"status": "ok"}
 
 
 async def direct_chat(request_body: dict, skip_thinking: bool = False) -> dict:
     """
-    Forward request directly to llama-server WITHOUT tools.
-    Used when the classifier determines no web search is needed.
-    If skip_thinking is True, injects a hint to suppress reasoning.
+    Forward request directly to llama-server WITHOUT tools (non-streaming).
+    Used for non-streaming requests or as fallback.
     """
-    backend_url = await get_active_backend()
+    backend_url, model_type = await get_active_backend()
     log.info("Direct chat (no search%s) using backend %s",
              ", no-think" if skip_thinking else "", backend_url)
 
@@ -793,11 +935,17 @@ async def direct_chat(request_body: dict, skip_thinking: bool = False) -> dict:
 
     result = resp.json()
 
+    # Apply harmony cleanup if needed
+    if result.get("choices") and model_type == "harmony":
+        msg = result["choices"][0]["message"]
+        content = msg.get("content") or ""
+        if content:
+            cleaned = extract_final_content(content)
+            msg["content"] = cleaned if cleaned else content
+
     # Strip reasoning_content
     if result.get("choices"):
         msg = result["choices"][0]["message"]
-        if not msg.get("content") and msg.get("reasoning_content"):
-            msg["content"] = msg["reasoning_content"]
         if "reasoning_content" in msg:
             del msg["reasoning_content"]
 
@@ -814,12 +962,10 @@ async def chat_completions(request: Request):
     # Allow explicit opt-in/out via request parameters
     force_search = body.pop("web_search", None)
     force_no_think = body.pop("thinking", None) is False  # "thinking": false
+    stream_reasoning = body.pop("stream_reasoning", False)  # send thinking tokens to client
 
     messages = body.get("messages", [])
-    searxng_ok = await check_searxng_available()
-    if not searxng_ok:
-        intent = "no_search"
-    elif force_search is True:
+    if force_search is True:
         intent = "search"
     elif force_search is False:
         intent = "no_search"
@@ -840,63 +986,44 @@ async def chat_completions(request: Request):
     log.info("Search intent: %s%s", intent,
              f" ({skip_reason}, skip thinking)" if skip_reason else "")
 
+    # Get active backend
+    backend_url, model_type = await get_active_backend()
+
+    # --- STREAMING PATH ---
+    if was_streaming:
+        strip_reasoning = not stream_reasoning
+        if skip_thinking:
+            log.info("Streaming direct (no-think) via %s", backend_url)
+            return StreamingResponse(
+                stream_direct(body, backend_url, skip_thinking=True),
+                media_type="text/event-stream",
+            )
+        elif intent == "no_search":
+            log.info("Streaming direct (thinking%s) via %s",
+                     "+reasoning" if stream_reasoning else "", backend_url)
+            return StreamingResponse(
+                stream_direct(body, backend_url, skip_thinking=False,
+                              strip_reasoning=strip_reasoning),
+                media_type="text/event-stream",
+            )
+        else:
+            log.info("Streaming agentic search (reasoning=%s) via %s",
+                     stream_reasoning, backend_url)
+            return StreamingResponse(
+                stream_agentic(body, backend_url, model_type,
+                               strip_reasoning=strip_reasoning),
+                media_type="text/event-stream",
+            )
+
+    # --- NON-STREAMING PATH ---
     if skip_thinking:
-        # Fast path — no tools, no thinking
         result = await direct_chat(body, skip_thinking=True)
     elif intent == "no_search":
-        # Fast path — skip tools entirely
         result = await direct_chat(body)
     else:
-        # 'search' or 'ambiguous' — use agentic loop with tools
         result = await agentic_chat(body)
 
-    if was_streaming and result.get("choices"):
-        # Convert the complete result into SSE format for streaming clients
-        return StreamingResponse(
-            _result_to_sse(result),
-            media_type="text/event-stream",
-        )
-
     return JSONResponse(content=result)
-
-
-async def _result_to_sse(result: dict):
-    """Convert a complete chat completion result into SSE events."""
-    choice = result["choices"][0]
-    content = choice["message"].get("content", "")
-
-    # Send the content as a single streamed chunk
-    chunk = {
-        "id": result.get("id", ""),
-        "object": "chat.completion.chunk",
-        "created": result.get("created", 0),
-        "model": result.get("model", ""),
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"role": "assistant", "content": content},
-                "finish_reason": None,
-            }
-        ],
-    }
-    yield f"data: {json.dumps(chunk)}\n\n"
-
-    # Send the finish event
-    finish_chunk = {
-        "id": result.get("id", ""),
-        "object": "chat.completion.chunk",
-        "created": result.get("created", 0),
-        "model": result.get("model", ""),
-        "choices": [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": choice.get("finish_reason", "stop"),
-            }
-        ],
-    }
-    yield f"data: {json.dumps(finish_chunk)}\n\n"
-    yield "data: [DONE]\n\n"
 
 
 @app.get("/v1/models")
@@ -921,7 +1048,7 @@ async def list_models():
 async def proxy(path: str, request: Request):
     """Proxy all other endpoints directly to the active llama-server."""
     try:
-        backend_url = await get_active_backend()
+        backend_url, _ = await get_active_backend()
         body = await request.body()
         headers = {
             k: v for k, v in request.headers.items()

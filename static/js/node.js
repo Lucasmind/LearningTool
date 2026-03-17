@@ -174,11 +174,14 @@ const NodeRenderer = (() => {
         let responseSection;
         if (nodeData.status === 'pending' || nodeData.status === 'queued') {
             responseSection = `
-                <div class="node-queued">Queued, waiting for AI...</div>`;
+                <div class="node-thinking">
+                    Researching
+                    <div class="thinking-dots"><span></span><span></span><span></span></div>
+                </div>`;
         } else if (nodeData.status === 'running') {
             responseSection = `
                 <div class="node-thinking">
-                    Thinking
+                    Formulating response
                     <div class="thinking-dots"><span></span><span></span><span></span></div>
                 </div>`;
         } else if (nodeData.status === 'error') {

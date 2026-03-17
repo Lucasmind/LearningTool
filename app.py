@@ -276,6 +276,7 @@ async def generate_title(req: QueryRequest):
             f'for a research session about this question:\n"{req.prompt_text}"\n'
             f'Reply with ONLY the title, nothing else.',
             timeout=30,
+            thinking=False,  # Skip reasoning for utility requests (saves 10-20s)
         )
         title = result.get("text", "").strip().strip('"\'').strip()
         # Take first line only, limit length

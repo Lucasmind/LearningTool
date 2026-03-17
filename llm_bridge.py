@@ -88,11 +88,12 @@ class OpenAICompatibleProvider:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
-    async def submit(self, prompt: str, timeout: int = None) -> dict:
-        """Send prompt and return complete response (non-streaming)."""
+    async def submit(self, prompt: str, timeout: int = None, **extra) -> dict:
+        """Send prompt and return complete response (non-streaming).
+        Extra kwargs (e.g. thinking=False) are passed through to the LLM payload."""
         t = timeout or self._timeout
         return await asyncio.get_event_loop().run_in_executor(
-            None, self._call_llm, prompt, t
+            None, self._call_llm, prompt, t, extra
         )
 
     async def stream(self, prompt: str, timeout: int = None):
@@ -142,14 +143,17 @@ class OpenAICompatibleProvider:
                 "response_preview": "",
             }
 
-    def _call_llm(self, prompt: str, timeout: int) -> dict:
+    def _call_llm(self, prompt: str, timeout: int, extra: dict = None) -> dict:
         """Synchronous non-streaming call."""
-        payload = json.dumps({
+        body = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self._max_tokens,
             "temperature": self._temperature,
-        }).encode("utf-8")
+        }
+        if extra:
+            body.update(extra)
+        payload = json.dumps(body).encode("utf-8")
 
         req = Request(
             self._url,
@@ -173,13 +177,18 @@ class OpenAICompatibleProvider:
             raise RuntimeError(f"Unexpected LLM response format: {e}")
 
     def _stream_llm(self, prompt: str, timeout: int):
-        """Synchronous generator yielding (event_type, data) from streaming LLM."""
+        """Synchronous generator yielding (event_type, data) from streaming LLM.
+
+        Requests stream_reasoning=true so that thinking tokens arrive as
+        reasoning_content deltas, making phase detection explicit.
+        """
         payload = json.dumps({
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self._max_tokens,
             "temperature": self._temperature,
             "stream": True,
+            "stream_reasoning": True,
         }).encode("utf-8")
 
         req = Request(
@@ -205,10 +214,9 @@ class OpenAICompatibleProvider:
                     yield ("done", clean)
                     return
 
-                # True SSE streaming
-                raw_buffer = ""
+                # True SSE streaming with explicit reasoning_content support
                 content_buffer = ""
-                phase = "detecting"  # detecting | thinking | content
+                thinking_emitted = False
 
                 while True:
                     raw_line = resp.readline()
@@ -223,52 +231,35 @@ class OpenAICompatibleProvider:
 
                     try:
                         chunk = json.loads(data_str)
-                        token = chunk["choices"][0]["delta"].get("content", "")
+                        delta = chunk["choices"][0]["delta"]
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
+
+                    # Reasoning tokens (thinking phase) — emit once to signal UI
+                    reasoning = delta.get("reasoning_content", "")
+                    if reasoning:
+                        if not thinking_emitted:
+                            thinking_emitted = True
+                            yield ("thinking", "")
+                        continue  # Don't display thinking tokens
+
+                    # Content tokens — the visible answer
+                    token = delta.get("content", "")
                     if not token:
                         continue
 
-                    raw_buffer += token
+                    content_buffer += token
+                    yield ("token", token)
 
-                    if phase == "detecting":
-                        stripped = raw_buffer.lstrip()
-                        if len(stripped) < 15:
-                            continue
-                        if _has_thinking(stripped):
-                            phase = "thinking"
-                            yield ("thinking", "")
-                        else:
-                            phase = "content"
-                            content_buffer = raw_buffer
-                            yield ("token", content_buffer)
-
-                    elif phase == "thinking":
-                        # Check for content transition
-                        match = re.search(r'^#{1,6}\s', raw_buffer, re.MULTILINE)
-                        has_final = '<|channel|>final<|message|>' in raw_buffer
-                        if match or has_final:
-                            phase = "content"
-                            content_buffer = _strip_thinking(raw_buffer)
-                            yield ("token", content_buffer)
-
-                    elif phase == "content":
-                        content_buffer += token
-                        yield ("token", token)
-
-                # Edge cases: never left detecting or thinking phase
-                if phase == "detecting" and raw_buffer:
-                    content_buffer = _strip_thinking(raw_buffer)
-                    if content_buffer:
-                        yield ("token", content_buffer)
-                elif phase == "thinking":
-                    content_buffer = _strip_thinking(raw_buffer)
-                    if content_buffer:
-                        yield ("token", content_buffer)
-
-                # Always apply _strip_thinking as final safety net
+                # Apply _strip_thinking as safety net for servers that don't
+                # use reasoning_content and embed thinking in content instead
                 content_buffer = _strip_thinking(content_buffer) if content_buffer else ""
-                yield ("done", content_buffer)
+
+                # If stream ended with no content, report as error
+                if not content_buffer:
+                    yield ("error", "LLM returned an empty response. The server may have encountered an internal error.")
+                else:
+                    yield ("done", content_buffer)
 
         except URLError as e:
             raise RuntimeError(
