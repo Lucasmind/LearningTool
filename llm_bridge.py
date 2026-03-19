@@ -13,7 +13,7 @@ from urllib.error import URLError
 from claude_cli_provider import ClaudeCLIProvider
 
 
-# Default LLM endpoint (chimera AI server)
+# Default LLM endpoint
 DEFAULT_LLM_URL = "http://localhost:11434/v1/chat/completions"
 DEFAULT_LLM_MODEL = ""
 

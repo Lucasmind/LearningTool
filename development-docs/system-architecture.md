@@ -70,7 +70,7 @@ The main server file. Parses CLI args, initializes shared state, defines all API
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | 8100 | Server port |
-| `--llm-url` | `http://192.168.1.221:8080/v1/chat/completions` | LLM endpoint (used for first-run seeding only) |
+| `--llm-url` | `http://localhost:11434/v1/chat/completions` | LLM endpoint (used for first-run seeding only) |
 | `--llm-model` | `""` | Model name (used for first-run seeding only) |
 
 **Note:** CLI args `--llm-url` and `--llm-model` are only used to seed the initial `settings/providers.json` on first run. After that, provider configuration is managed through the settings UI and persisted in the settings file.
@@ -187,9 +187,9 @@ File-based JSON persistence for LLM provider configuration.
   "fallback_provider_id": "claudecode",
   "providers": {
     "local-llm": {
-      "id": "local-llm", "alias": "OSS120", "type": "openai-compatible",
-      "url": "http://192.168.1.221:8081/v1/chat/completions",
-      "model": "gpt-oss-120b", "api_key": "", "enabled": true,
+      "id": "local-llm", "alias": "Local LLM", "type": "openai-compatible",
+      "url": "http://localhost:11434/v1/chat/completions",
+      "model": "", "api_key": "", "enabled": true,
       "max_tokens": 30000, "temperature": 0.7, "timeout": 300
     }
   }
@@ -668,7 +668,7 @@ ContextMenu.handleAction()
 **External services:**
 - Any OpenAI-compatible LLM server (configured via settings UI)
 - Claude Code CLI binary (optional, for Claude Code subscription users)
-- Default: chimera AI orchestrator at `192.168.1.221:8081` with web search, model `gpt-oss-120b`
+- Default: Ollama at `localhost:11434` (or bundled orchestrator with web search in Docker mode)
 
 ---
 
