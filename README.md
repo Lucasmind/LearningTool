@@ -6,9 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-green.svg)](https://www.python.org/)
 [![No Build Step](https://img.shields.io/badge/Frontend-No%20Build%20Step-orange.svg)](#architecture)
 
-<!-- TODO: Add demo GIF here
-![Demo](docs/demo.gif)
--->
+<video src="demo.mp4" autoplay loop muted playsinline width="800"></video>
 
 ## How It Works
 
