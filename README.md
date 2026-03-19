@@ -32,15 +32,22 @@ Everything you need in one command. The setup script detects your hardware, lets
 git clone https://github.com/Lucasmind/LearningTool.git
 cd LearningTool
 python3 setup.py
-docker compose up --build
+./start.sh
 # Opens at http://localhost:8100
 ```
 
 **What gets installed:**
 - LearningTool web app (port 8100)
-- llama.cpp server running your chosen model (Vulkan GPU or CPU)
+- llama.cpp server running your chosen model (CUDA, Vulkan, or CPU)
 - Smart orchestrator with web search capability
 - SearXNG meta-search engine (optional)
+
+**Management:**
+```bash
+./start.sh      # Start all services
+./stop.sh       # Stop all services
+./restart.sh    # Restart all services
+```
 
 **Requirements:** Docker, Docker Compose, Python 3.10+ (for setup script only)
 
