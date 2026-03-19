@@ -46,7 +46,7 @@
       "context_window": 131072,
       "supports_vision": false,
       "supports_thinking": false,
-      "supports_tools": true,
+      "supports_tools": false,
       "recommended_threads": 4,
       "recommended_batch_size": 512
     },
