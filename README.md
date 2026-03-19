@@ -8,6 +8,10 @@
 
 ![Demo — highlight text to branch into deeper exploration](demo.gif)
 
+## A Quick Note
+
+Were you ever researching something from an LLM chat and in the middle of it you read something you don't quite understand and you want to know more? I do, all the time, but I didn't really see a useful interface for that. There's lots of options kind of like this out there, but this one is free, works on almost any compute platform, and still gives you reasonable results -- especially if you can run the web search. I might add more features over time. If you have a good idea, put in an issue. Otherwise, fork it, break it, make it your own. Good vibes to you!
+
 ## How It Works
 
 1. **Ask a question** -- type in the top bar, get a streaming AI response in a visual node
@@ -19,6 +23,8 @@
 4. **Keep branching** -- build a tree of understanding as deep as you want
 
 Each node carries the conversation context forward, so the AI always knows what you've explored so far.
+
+**Web Search:** Include "search the web" anywhere in your question and the system will search the internet for the latest information before answering. This works with the bundled full stack setup or any backend running the included orchestrator.
 
 ## Quick Start
 
@@ -77,15 +83,17 @@ python app.py
 
 ## Bundled Models
 
-The setup script offers models at every hardware tier:
+The setup script offers models at every hardware tier. RAM listed is **GPU VRAM** required (or system RAM for CPU-only mode):
 
-| Tier | Model | RAM | Quality | Best For |
-|------|-------|-----|---------|----------|
-| Tiny | Llama 3.2 1B | 2 GB | Basic | Testing, Raspberry Pi |
-| Small | Qwen3 4B | 4 GB | Decent | 8GB machines |
-| Medium | Qwen3 8B | 8 GB | Good | 16GB laptops |
-| Large | Qwen3.5 27B | 20 GB | Very good | 32GB desktops |
-| XL | Qwen3 235B-A22B | 64 GB | Excellent | 128GB workstations |
+| Tier | Model | GPU RAM | Quality | Web Search | Best For |
+|------|-------|---------|---------|------------|----------|
+| Tiny | Llama 3.2 1B | 2 GB | Basic | No | Testing, Raspberry Pi |
+| Small | Qwen3 4B | 4 GB | Decent | Yes | 8GB VRAM GPUs |
+| Medium | Qwen3 8B | 8 GB | Good | Yes | 16GB laptops |
+| Large | Qwen3.5 27B | 20 GB | Very good | Yes | 24GB+ VRAM GPUs |
+| XL | Qwen3 235B-A22B | 64 GB | Excellent | Yes | 128GB unified memory workstations |
+
+Models 4B and above support web search via tool calling. The 1B model works for direct questions but cannot call the search tools.
 
 Hardware detection checks your RAM, GPU, and disk space, then shows which models will actually run.
 
