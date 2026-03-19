@@ -9,3 +9,4 @@ models/
 docker-compose.yml
 *.yml.bak
 infrastructure/**/__pycache__/
+CLAUDE.md
