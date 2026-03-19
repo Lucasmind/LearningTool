@@ -633,7 +633,11 @@ def interactive_setup():
         elif status == "tight":
             reason = " -- tight fit"
 
-        print(f"  {marker} [{i+1}] {m['name']} {tier_label}")
+        no_tools_warn = ""
+        if not m.get("supports_tools"):
+            no_tools_warn = " [no web search]"
+
+        print(f"  {marker} [{i+1}] {m['name']} {tier_label}{no_tools_warn}")
         print(f"         {m['description']}{feat_str}")
         print(f"         RAM: {m['ram_gb']}GB | Disk: {m['disk_gb']}GB | Context: {m['context_window']//1024}K{reason}")
         print()
@@ -666,6 +670,17 @@ def interactive_setup():
                 if status in ("no_ram", "no_disk"):
                     print(f"  Warning: {model['name']} may not fit on your system.")
                     confirm = input("  Continue anyway? [y/N]: ").strip().lower()
+                    if confirm != "y":
+                        continue
+                if not model.get("supports_tools"):
+                    print()
+                    print(f"  Note: {model['name']} does not support tool calling.")
+                    print(f"  Web search will NOT work with this model — the model")
+                    print(f"  cannot call the search tools. Direct questions will")
+                    print(f"  still work fine.")
+                    print()
+                    print(f"  For web search, choose a model with tool support (4B+).")
+                    confirm = input("  Continue with this model? [y/N]: ").strip().lower()
                     if confirm != "y":
                         continue
                 break

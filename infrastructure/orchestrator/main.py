@@ -47,6 +47,10 @@ log = logging.getLogger("orchestrator")
 
 app = FastAPI(title="LearningTool Orchestrator with Web Search")
 
+# Track whether the backend model supports tool calling.
+# If the first tool attempt fails with 500, disable tools for future requests.
+_tools_supported = True
+
 
 # ---------------------------------------------------------------------------
 # Backend discovery — find a healthy LLM backend (llama.cpp, Ollama, vLLM, etc.)
@@ -151,8 +155,13 @@ BROWSER_TOOLS = [
 # ---------------------------------------------------------------------------
 
 
-async def execute_search(query: str, topn: int = 5) -> str:
+async def execute_search(query: str, topn: int | str = 5) -> str:
     """Query SearXNG and return formatted results."""
+    # Coerce topn to int — small models sometimes pass "5" instead of 5
+    try:
+        topn = int(topn)
+    except (ValueError, TypeError):
+        topn = SEARCH_RESULTS_COUNT
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -180,8 +189,16 @@ async def execute_search(query: str, topn: int = 5) -> str:
     return "\n\n".join(formatted)
 
 
-async def execute_open(url: str, num_lines: int = 120, cursor: int = 0) -> str:
+async def execute_open(url: str, num_lines: int | str = 120, cursor: int | str = 0) -> str:
     """Fetch a URL, extract text, cache it, and return requested lines."""
+    try:
+        num_lines = int(num_lines)
+    except (ValueError, TypeError):
+        num_lines = 60
+    try:
+        cursor = int(cursor)
+    except (ValueError, TypeError):
+        cursor = 0
     if url not in page_cache:
         try:
             async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -474,12 +491,17 @@ async def agentic_chat(request_body: dict) -> dict:
             )
 
         if resp.status_code != 200:
+            global _tools_supported
             error_body = resp.text[:500]
             log.error("Backend returned %d on tool round %d: %s",
                       resp.status_code, round_num + 1, error_body)
             log.error("Payload keys: %s, message roles: %s",
                       list(payload.keys()),
                       [m.get("role") for m in messages])
+            # Mark tools as unsupported so future requests skip agentic path
+            if round_num == 0 and "Failed to parse" in error_body:
+                _tools_supported = False
+                log.warning("Model cannot handle tool calls — disabling tools for future requests")
             # Fall back to direct answer without tools
             return await _get_final_answer(request_body, messages, backend_url)
 
@@ -772,12 +794,17 @@ async def stream_agentic(request_body: dict, backend_url: str,
             )
 
         if resp.status_code != 200:
+            global _tools_supported
             error_body = resp.text[:500]
             log.error("Backend returned %d on tool round %d: %s",
                       resp.status_code, round_num + 1, error_body)
             log.error("Payload keys: %s, message roles: %s",
                       list(payload.keys()),
                       [m.get("role") for m in messages])
+            # Mark tools as unsupported so future requests skip agentic path
+            if round_num == 0 and "Failed to parse" in error_body:
+                _tools_supported = False
+                log.warning("Model cannot handle tool calls — disabling tools for future requests")
             # Fall back to streaming without tools instead of crashing
             final_payload = {**request_body, "messages": messages}
             async for chunk in _stream_from_backend(backend_url, final_payload,
@@ -955,6 +982,12 @@ async def chat_completions(request: Request):
         skip_reason = "image request"
     log.info("Search intent: %s%s", intent,
              f" ({skip_reason}, skip thinking)" if skip_reason else "")
+
+    # If the backend model doesn't support tool calling, downgrade search to direct
+    global _tools_supported
+    if intent == "search" and not _tools_supported:
+        log.info("Model does not support tools — downgrading search to direct")
+        intent = "no_search"
 
     # Get active backend
     backend_url = await get_active_backend()
